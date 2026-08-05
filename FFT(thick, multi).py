@@ -277,19 +277,15 @@ class FFTPlatformGUI(tk.Tk):
 
         self.monitor_tab = ttk.Frame(self.view_notebook)
         self.optical_tab = ttk.Frame(self.view_notebook)
-        self.fitting_tab = ttk.Frame(self.view_notebook)
         self.tmax_tab = ttk.Frame(self.view_notebook)
         self.view_notebook.add(self.monitor_tab, text="T Monitor")
         self.view_notebook.add(self.optical_tab, text="n / k / alpha / phase")
-        self.view_notebook.add(self.fitting_tab, text="Peak fitting")
         self.view_notebook.add(self.tmax_tab, text="Tmax trend")
 
         self.monitor_tab.rowconfigure(0, weight=1)
         self.monitor_tab.columnconfigure(0, weight=1)
         self.optical_tab.rowconfigure(0, weight=1)
         self.optical_tab.columnconfigure(0, weight=1)
-        self.fitting_tab.rowconfigure(0, weight=1)
-        self.fitting_tab.columnconfigure(0, weight=1)
         self.tmax_tab.rowconfigure(0, weight=1)
         self.tmax_tab.columnconfigure(0, weight=1)
 
@@ -319,12 +315,6 @@ class FFTPlatformGUI(tk.Tk):
 
         self.optical_canvas = FigureCanvasTkAgg(self.optical_figure, master=self.optical_tab)
         self.optical_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-
-        ttk.Label(
-            self.fitting_tab,
-            text="Lorentzian / Gaussian / Fano peak fitting will be added here.",
-            anchor="center",
-        ).grid(row=0, column=0, sticky="nsew")
 
         self.tmax_canvas = FigureCanvasTkAgg(self.tmax_figure, master=self.tmax_tab)
         self.tmax_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")

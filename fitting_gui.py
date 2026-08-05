@@ -47,6 +47,20 @@ FIT_MODELS: dict[str, FitModel] = {
     "Gaussian": FitModel("Gaussian", gaussian, 2.0 * np.sqrt(2.0 * np.log(2.0)), "sigma"),
 }
 MODEL_OPTIONS = ("Lorentzian", "Gaussian", "Fano (planned)", "Drude-Smith (planned)")
+MODEL_DESCRIPTIONS = {
+    "Lorentzian": (
+        "T(f) = b + A*Gamma^2 / ((f - f0)^2 + Gamma^2)\n"
+        "b: baseline, A: peak height, f0: resonance frequency, Gamma: HWHM\n"
+        "FWHM = 2*Gamma; Q = (f @ Tmax) / FWHM"
+    ),
+    "Gaussian": (
+        "T(f) = b + A*exp(-(f - f0)^2 / (2*sigma^2))\n"
+        "b: baseline, A: peak height, f0: center, sigma: standard deviation\n"
+        "FWHM = 2*sqrt(2*ln(2))*sigma; Q = (f @ Tmax) / FWHM"
+    ),
+    "Fano (planned)": "Fano asymmetric resonance model — planned for a future update.",
+    "Drude-Smith (planned)": "Drude-Smith carrier-response model — planned for a future update.",
+}
 
 
 @dataclass(frozen=True)
@@ -143,6 +157,7 @@ class TransmittanceFittingWindow(tk.Toplevel):
         self.fit_max = tk.StringVar(value=f"{DEFAULT_FIT_MAX_THZ:g}")
         self.fit_mode = tk.StringVar(value="single")
         self.status = tk.StringVar(value="Select a resonance model, then run a single fit.")
+        self.model_formula = tk.StringVar()
         self.result_values = {
             "Tmax": tk.StringVar(value="—"),
             "f @ Tmax": tk.StringVar(value="—"),
@@ -205,16 +220,23 @@ class TransmittanceFittingWindow(tk.Toplevel):
         self.model_list.selection_set(0)
         self.model_list.bind("<<ListboxSelect>>", self._on_model_changed)
 
+        ttk.Label(controls, text="Model equation", font=("Segoe UI", 10, "bold")).grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(10, 2)
+        )
+        ttk.Label(controls, textvariable=self.model_formula, wraplength=300, justify="left").grid(
+            row=9, column=0, columnspan=2, sticky="w"
+        )
+
         self.run_button = ttk.Button(controls, text="Run single fit", command=self._run_fit)
-        self.run_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 6))
+        self.run_button.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(12, 6))
         ttk.Label(controls, textvariable=self.status, wraplength=300).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(0, 12)
+            row=11, column=0, columnspan=2, sticky="w", pady=(0, 12)
         )
 
         ttk.Label(controls, text="Fit result", font=("Segoe UI", 10, "bold")).grid(
-            row=10, column=0, columnspan=2, sticky="w", pady=(0, 4)
+            row=12, column=0, columnspan=2, sticky="w", pady=(0, 4)
         )
-        for row, (label, value) in enumerate(self.result_values.items(), start=11):
+        for row, (label, value) in enumerate(self.result_values.items(), start=13):
             ttk.Label(controls, text=label).grid(row=row, column=0, sticky="w", pady=2)
             ttk.Label(controls, textvariable=value).grid(row=row, column=1, sticky="w", pady=2)
 
@@ -222,6 +244,7 @@ class TransmittanceFittingWindow(tk.Toplevel):
         self.ax = self.figure.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._update_model_formula()
 
     def _selected_model_name(self) -> str | None:
         selection = self.model_list.curselection()
@@ -229,10 +252,15 @@ class TransmittanceFittingWindow(tk.Toplevel):
 
     def _on_model_changed(self, _event=None) -> None:
         model_name = self._selected_model_name()
+        self._update_model_formula()
         if model_name not in FIT_MODELS:
             self.status.set(f"{model_name} is reserved for a future implementation.")
         else:
             self.status.set(f"{model_name} selected. Run single fit to calculate resonance metrics.")
+
+    def _update_model_formula(self) -> None:
+        model_name = self._selected_model_name()
+        self.model_formula.set(MODEL_DESCRIPTIONS.get(model_name, "Select a model to see its fitting equation."))
 
     def _on_mode_changed(self) -> None:
         if self.fit_mode.get() == "cumulative":
