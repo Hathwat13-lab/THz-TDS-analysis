@@ -93,9 +93,27 @@ fitting이 끝나면 선택한 모델을 fit 대역 전체의 4,001개 균일 �
 | `f @ Tmax` | Frequency at which that fitted maximum occurs. For a well-behaved positive Lorentzian or Gaussian, this is essentially $f_0$. |
 | `FWHM` | Calculated analytically from $\Gamma$ (Lorentzian) or $\sigma$ (Gaussian), using the equations above. |
 | `Q` | $Q = \frac{f_{T_{\max}}}{\mathrm{FWHM}}$. This is dimensionless because both terms use THz. |
+| `R²` | 선택 fitting 대역의 원본 data point에서 계산한 coefficient of determination입니다. GUI에서는 percent로 표시합니다. |
+| `Adjusted R²` | parameter 수를 반영해 보정한 R²입니다. 현재 single model은 $p=4$개의 parameter를 사용하며, GUI에서는 percent로 표시합니다. |
 
 따라서 `Tmax`는 단순히 noise가 포함된 raw sample point 중 최댓값이 아니라
 **model-based** 값입니다. 샘플 사이를 매끄럽고 일관된 기준으로 비교할 때 유용합니다.
+
+현재 구현의 fit-quality 계산은 다음과 같습니다. $y_i$는 fitting에 사용된 원본
+transmittance, $\hat{y}_i$는 해당 원본 주파수에서의 fitted value, $n$은 사용한 data
+point 수입니다.
+
+$$
+R^2 = 1 - \frac{\sum_i(y_i-\hat{y}_i)^2}{\sum_i(y_i-\bar{y})^2}
+$$
+
+$$
+\mathrm{Adjusted}\ R^2 = 1-(1-R^2)\frac{n-1}{n-p-1}
+$$
+
+Adjusted R²는 parameter를 추가해 무조건 좋아 보이는 현상을 어느 정도 보정합니다.
+현재는 $n > p+1$일 때만 계산하며, 그렇지 않으면 `—`를 표시합니다. R²가 높더라도
+residual의 모양과 모델의 물리적 타당성은 별도로 확인해야 합니다.
 
 ## Lorentzian과 Gaussian 선택
 
