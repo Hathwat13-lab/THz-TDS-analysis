@@ -1,0 +1,6 @@
+# Keep this repository source-only. Measurement data and generated outputs
+# must remain local unless they are explicitly added to this allowlist.
+/*
+!.gitignore
+!functions.py
+!FFT(thick, multi).py
