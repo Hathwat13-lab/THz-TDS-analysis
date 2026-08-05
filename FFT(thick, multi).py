@@ -19,6 +19,32 @@ TMAX_FREQUENCY_MIN_THZ = 0.5
 TMAX_FREQUENCY_MAX_THZ = 2.5
 
 
+def export_tmax_metrics_to_excel(metrics: list[tuple[Path, float, float]], output_path: str | Path) -> pd.DataFrame:
+    """Save the already-sorted Tmax metrics as a formatted Excel worksheet."""
+
+    table = pd.DataFrame(
+        {
+            "no.": range(1, len(metrics) + 1),
+            "name": [sample_path.name for sample_path, _, _ in metrics],
+            "f@Tmax [THz]": [frequency for _, frequency, _ in metrics],
+            "Tmax": [value for _, _, value in metrics],
+        }
+    )
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        table.to_excel(writer, sheet_name="Tmax trend", index=False)
+        worksheet = writer.sheets["Tmax trend"]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for cell in worksheet[1]:
+            cell.font = cell.font.copy(bold=True)
+        for column, width in {"A": 8, "B": 48, "C": 18, "D": 18}.items():
+            worksheet.column_dimensions[column].width = width
+        for row in worksheet.iter_rows(min_row=2, min_col=3, max_col=4):
+            for cell in row:
+                cell.number_format = "0.000000"
+    return table
+
+
 class FFTPlatformGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -286,7 +312,7 @@ class FFTPlatformGUI(tk.Tk):
         self.monitor_tab.columnconfigure(0, weight=1)
         self.optical_tab.rowconfigure(0, weight=1)
         self.optical_tab.columnconfigure(0, weight=1)
-        self.tmax_tab.rowconfigure(0, weight=1)
+        self.tmax_tab.rowconfigure(1, weight=1)
         self.tmax_tab.columnconfigure(0, weight=1)
 
         self.monitor_figure = Figure(figsize=(11.5, 9.0), dpi=100, constrained_layout=True)
@@ -316,8 +342,13 @@ class FFTPlatformGUI(tk.Tk):
         self.optical_canvas = FigureCanvasTkAgg(self.optical_figure, master=self.optical_tab)
         self.optical_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
+        tmax_toolbar = ttk.Frame(self.tmax_tab, padding=(0, 0, 0, 6))
+        tmax_toolbar.grid(row=0, column=0, sticky="ew")
+        ttk.Label(tmax_toolbar, text="Sorted by f@Tmax (ascending)").pack(side="left")
+        ttk.Button(tmax_toolbar, text="Export Tmax to Excel", command=self._export_tmax_to_excel).pack(side="right")
+
         self.tmax_canvas = FigureCanvasTkAgg(self.tmax_figure, master=self.tmax_tab)
-        self.tmax_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.tmax_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
 
     def _build_default_views(self) -> None:
         self._style_monitor_axes()
@@ -673,6 +704,29 @@ class FFTPlatformGUI(tk.Tk):
                 (position, value),
                 xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8,
             )
+
+    def _export_tmax_to_excel(self) -> None:
+        if not self.tmax_metrics:
+            messagebox.showinfo("Export Tmax", "Run the analysis first so Tmax metrics are available.")
+            return
+
+        output_path = filedialog.asksaveasfilename(
+            title="Export Tmax trend to Excel",
+            defaultextension=".xlsx",
+            initialfile="tmax_trend.xlsx",
+            filetypes=[("Excel workbook", "*.xlsx")],
+        )
+        if not output_path:
+            return
+        try:
+            table = export_tmax_metrics_to_excel(self.tmax_metrics, output_path)
+        except Exception as exc:
+            self.status.set(f"Excel export failed: {exc}")
+            messagebox.showerror("Export Tmax", str(exc))
+            return
+
+        self.status.set(f"Exported {len(table)} Tmax row(s) to {Path(output_path).name}")
+        messagebox.showinfo("Export Tmax", f"Saved {len(table)} row(s) to:\n{output_path}")
 
     def _set_summary(self, text: str) -> None:
         self.summary.configure(state="normal")
