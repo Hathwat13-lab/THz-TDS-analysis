@@ -164,6 +164,11 @@ class FFTPlatformGUI(tk.Tk):
         )
         row += 1
 
+        ttk.Button(self.control_frame, text="Open fitting window", command=self._open_fitting_window).grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6)
+        )
+        row += 1
+
         ttk.Label(self.control_frame, text="Status").grid(row=row, column=0, sticky="w")
         ttk.Label(self.control_frame, textvariable=self.status, wraplength=280).grid(
             row=row, column=1, columnspan=2, sticky="w"
@@ -362,6 +367,23 @@ class FFTPlatformGUI(tk.Tk):
             f"Echo guideline ready for {sample_path.name}: n={guideline['n_mean']:.4f}, dt={guideline['echo_dt_ps']:.4f} ps"
         )
         self._render_active_result()
+
+    def _open_fitting_window(self) -> None:
+        """Launch the independent fitting UI for the currently active spectrum."""
+
+        _index, entry = self._selected_result()
+        if entry is None:
+            messagebox.showinfo("Transmittance fitting", "Run the analysis first and select an active sample.")
+            return
+
+        sample_path, result = entry
+        try:
+            from fitting_gui import open_fitting_window
+
+            open_fitting_window(self, result.transmittance, sample_path.name)
+        except Exception as exc:
+            self.status.set(f"Could not open fitting window: {exc}")
+            messagebox.showerror("Transmittance fitting", str(exc))
 
     def _style_monitor_axes(self) -> None:
         for ax in [self.ax_ref_td, self.ax_sample_td, self.ax_t]:
