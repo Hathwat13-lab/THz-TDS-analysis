@@ -107,6 +107,14 @@ class AnalysisResult:
 	echo_guideline: dict[str, object] | None = None
 
 
+@dataclass(frozen=True)
+class TransmittanceMaximum:
+	"""Maximum transmittance and its frequency within a trusted band."""
+
+	frequency_thz: float
+	transmittance: float
+
+
 def load_time_domain_data(
 	file_path: str | Path,
 	skiprows: int | None = None,
@@ -447,6 +455,43 @@ def plot_frequency_domain(
 	ax.set_ylabel("Amplitude")
 	ax.grid(True)
 	return ax
+
+
+def find_transmittance_maximum(
+	transmittance: pd.DataFrame,
+	frequency_min_thz: float = 0.5,
+	frequency_max_thz: float = 2.5,
+) -> TransmittanceMaximum:
+	"""Return the largest finite transmittance in the inclusive frequency band.
+
+	The default band is the high-SNR range used for sample-to-sample resonance
+	comparison.  The input is the ``AnalysisResult.transmittance`` DataFrame.
+	"""
+	if frequency_min_thz > frequency_max_thz:
+		raise ValueError("frequency_min_thz must not exceed frequency_max_thz.")
+	if not {"freq", "mag"}.issubset(transmittance.columns):
+		raise ValueError("transmittance must contain 'freq' and 'mag' columns.")
+
+	frequency = transmittance["freq"].to_numpy(dtype=float)
+	magnitude = transmittance["mag"].to_numpy(dtype=float)
+	valid = (
+		np.isfinite(frequency)
+		& np.isfinite(magnitude)
+		& (frequency >= frequency_min_thz)
+		& (frequency <= frequency_max_thz)
+	)
+	if not np.any(valid):
+		raise ValueError(
+			f"No finite transmittance data is available in "
+			f"{frequency_min_thz:g}-{frequency_max_thz:g} THz."
+		)
+
+	indices = np.flatnonzero(valid)
+	peak_index = indices[int(np.argmax(magnitude[indices]))]
+	return TransmittanceMaximum(
+		frequency_thz=float(frequency[peak_index]),
+		transmittance=float(magnitude[peak_index]),
+	)
 
 
 def build_frequency_axis(sample_rate: float, n_points: int) -> np.ndarray:

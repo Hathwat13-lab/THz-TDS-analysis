@@ -10,11 +10,13 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from functions import AsymmetricTDSAnalyzer
+from functions import AsymmetricTDSAnalyzer, find_transmittance_maximum
 
 
 DEFAULT_REFERENCE = ""
 DEFAULT_SAMPLE_FOLDER = ""
+TMAX_FREQUENCY_MIN_THZ = 0.5
+TMAX_FREQUENCY_MAX_THZ = 2.5
 
 
 class FFTPlatformGUI(tk.Tk):
@@ -49,6 +51,7 @@ class FFTPlatformGUI(tk.Tk):
         self.common_length: int | None = None
         self._active_result_index: int | None = None
         self.echo_guideline_cache: dict[Path, dict[str, object]] = {}
+        self.tmax_metrics: list[tuple[Path, float, float]] = []
 
         self._build_layout()
         self._build_default_views()
@@ -269,13 +272,21 @@ class FFTPlatformGUI(tk.Tk):
 
         self.monitor_tab = ttk.Frame(self.view_notebook)
         self.optical_tab = ttk.Frame(self.view_notebook)
+        self.fitting_tab = ttk.Frame(self.view_notebook)
+        self.tmax_tab = ttk.Frame(self.view_notebook)
         self.view_notebook.add(self.monitor_tab, text="T Monitor")
         self.view_notebook.add(self.optical_tab, text="n / k / alpha / phase")
+        self.view_notebook.add(self.fitting_tab, text="Peak fitting")
+        self.view_notebook.add(self.tmax_tab, text="Tmax trend")
 
         self.monitor_tab.rowconfigure(0, weight=1)
         self.monitor_tab.columnconfigure(0, weight=1)
         self.optical_tab.rowconfigure(0, weight=1)
         self.optical_tab.columnconfigure(0, weight=1)
+        self.fitting_tab.rowconfigure(0, weight=1)
+        self.fitting_tab.columnconfigure(0, weight=1)
+        self.tmax_tab.rowconfigure(0, weight=1)
+        self.tmax_tab.columnconfigure(0, weight=1)
 
         self.monitor_figure = Figure(figsize=(11.5, 9.0), dpi=100, constrained_layout=True)
         self.monitor_figure.set_constrained_layout_pads(w_pad=0.10, h_pad=0.12, wspace=0.10, hspace=0.12)
@@ -292,17 +303,34 @@ class FFTPlatformGUI(tk.Tk):
         self.ax_alpha = self.optical_figure.add_subplot(self.optical_gs[1, 0])
         self.ax_phase = self.optical_figure.add_subplot(self.optical_gs[1, 1])
 
+        self.tmax_figure = Figure(figsize=(11.5, 9.0), dpi=100, constrained_layout=True)
+        self.tmax_figure.set_constrained_layout_pads(w_pad=0.10, h_pad=0.12, wspace=0.10, hspace=0.16)
+        self.tmax_gs = self.tmax_figure.add_gridspec(2, 1)
+        self.ax_tmax_frequency = self.tmax_figure.add_subplot(self.tmax_gs[0, 0])
+        self.ax_tmax_value = self.tmax_figure.add_subplot(self.tmax_gs[1, 0], sharex=self.ax_tmax_frequency)
+
         self.monitor_canvas = FigureCanvasTkAgg(self.monitor_figure, master=self.monitor_tab)
         self.monitor_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
         self.optical_canvas = FigureCanvasTkAgg(self.optical_figure, master=self.optical_tab)
         self.optical_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
+        ttk.Label(
+            self.fitting_tab,
+            text="Lorentzian / Gaussian / Fano peak fitting will be added here.",
+            anchor="center",
+        ).grid(row=0, column=0, sticky="nsew")
+
+        self.tmax_canvas = FigureCanvasTkAgg(self.tmax_figure, master=self.tmax_tab)
+        self.tmax_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
     def _build_default_views(self) -> None:
         self._style_monitor_axes()
         self._style_optical_axes()
+        self._style_tmax_axes()
         self.monitor_canvas.draw_idle()
         self.optical_canvas.draw_idle()
+        self.tmax_canvas.draw_idle()
 
     def _bind_events(self) -> None:
         self.active_sample_combo.bind("<<ComboboxSelected>>", self._on_active_sample_selected)
@@ -373,9 +401,23 @@ class FFTPlatformGUI(tk.Tk):
         self.ax_phase.set_xlabel("Frequency [THz]")
         self.ax_phase.set_ylabel("Phase [rad]")
 
+    def _style_tmax_axes(self) -> None:
+        for ax in [self.ax_tmax_frequency, self.ax_tmax_value]:
+            ax.clear()
+            ax.grid(True, axis="y", alpha=0.3)
+
+        self.ax_tmax_frequency.set_title(
+            f"Frequency at Tmax ({TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz)")
+        self.ax_tmax_frequency.set_ylabel("Frequency [THz]")
+        self.ax_tmax_value.set_title(
+            f"Tmax ({TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz)")
+        self.ax_tmax_value.set_xlabel("Sample")
+        self.ax_tmax_value.set_ylabel("Transmittance")
+
     def _clear_views(self) -> None:
         self._style_monitor_axes()
         self._style_optical_axes()
+        self._style_tmax_axes()
 
     def _selected_result(self) -> tuple[int | None, tuple[Path, object] | None]:
         if not self.results:
@@ -402,6 +444,7 @@ class FFTPlatformGUI(tk.Tk):
         if entry is None:
             self.monitor_canvas.draw_idle()
             self.optical_canvas.draw_idle()
+            self.tmax_canvas.draw_idle()
             return
 
         highlight_name = None if index is None else self.results[index][0].name
@@ -552,8 +595,72 @@ class FFTPlatformGUI(tk.Tk):
         self.ax_alpha.legend(loc="best", fontsize=7)
         self.ax_phase.legend(loc="best", fontsize=7)
 
+        self._render_tmax_trend()
+
         self.monitor_canvas.draw_idle()
         self.optical_canvas.draw_idle()
+        self.tmax_canvas.draw_idle()
+
+    def _update_tmax_metrics(self) -> list[str]:
+        """Extract one in-band transmittance maximum per analyzed sample."""
+
+        self.tmax_metrics = []
+        unavailable = []
+        for sample_path, result in self.results:
+            try:
+                maximum = find_transmittance_maximum(
+                    result.transmittance,
+                    frequency_min_thz=TMAX_FREQUENCY_MIN_THZ,
+                    frequency_max_thz=TMAX_FREQUENCY_MAX_THZ,
+                )
+                self.tmax_metrics.append((sample_path, maximum.frequency_thz, maximum.transmittance))
+            except ValueError as exc:
+                unavailable.append(f"{sample_path.name}: {exc}")
+        self.tmax_metrics.sort(key=lambda metric: metric[1])
+        return unavailable
+
+    def _render_tmax_trend(self) -> None:
+        if not self.tmax_metrics:
+            message = (
+                f"No finite transmittance data is available in "
+                f"{TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz.\n"
+                "Adjust the FFT crop range and run the analysis again."
+            )
+            for ax in [self.ax_tmax_frequency, self.ax_tmax_value]:
+                ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes)
+            return
+
+        sample_labels = [f"{index}." for index in range(1, len(self.tmax_metrics) + 1)]
+        frequencies = np.array([frequency for _, frequency, _ in self.tmax_metrics])
+        transmittances = np.array([value for _, _, value in self.tmax_metrics])
+        positions = np.arange(1, len(self.tmax_metrics) + 1)
+
+        self.ax_tmax_frequency.plot(
+            positions, frequencies, color="tab:blue", marker="o", linewidth=1.8, markersize=5.5
+        )
+        self.ax_tmax_value.plot(
+            positions, transmittances, color="tab:orange", marker="o", linewidth=1.8, markersize=5.5
+        )
+        self.ax_tmax_frequency.set_ylim(
+            max(0.0, TMAX_FREQUENCY_MIN_THZ - 0.1), TMAX_FREQUENCY_MAX_THZ + 0.1
+        )
+        self.ax_tmax_value.set_ylim(bottom=0, top=max(1.0, float(np.max(transmittances)) * 1.15))
+        self.ax_tmax_value.set_xticks(positions, sample_labels, rotation=0, ha="center", fontsize=7)
+        self.ax_tmax_value.set_xlabel("Sample (ascending frequency at Tmax)")
+        self.ax_tmax_frequency.tick_params(axis="x", labelbottom=False)
+
+        for position, frequency in zip(positions, frequencies):
+            self.ax_tmax_frequency.annotate(
+                f"{frequency:.3g}",
+                (position, frequency),
+                xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8,
+            )
+        for position, value in zip(positions, transmittances):
+            self.ax_tmax_value.annotate(
+                f"{value:.3g}",
+                (position, value),
+                xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8,
+            )
 
     def _set_summary(self, text: str) -> None:
         self.summary.configure(state="normal")
@@ -631,15 +738,28 @@ class FFTPlatformGUI(tk.Tk):
                 raise ValueError("No selected sample could be analyzed.\n" + "\n".join(failures))
             self.results = results
             self.echo_guideline_cache.clear()
+            tmax_unavailable = self._update_tmax_metrics()
             self._set_active_result_options()
             self._render_active_result()
             self.status.set(f"Analysis complete: {len(results)}/{len(selected_paths)} sample(s)")
-            self._set_summary(self._format_multi_summary(results, reference_path, thickness_um, thickness_mode, failures))
+            self._set_summary(
+                self._format_multi_summary(
+                    results, reference_path, thickness_um, thickness_mode, failures, tmax_unavailable
+                )
+            )
         except Exception as exc:
             self.status.set(f"Error: {exc}")
             messagebox.showerror("Analysis failed", str(exc))
 
-    def _format_multi_summary(self, results, reference_path: str, thickness_um: float, thickness_mode: str, failures: list[str]) -> str:
+    def _format_multi_summary(
+        self,
+        results,
+        reference_path: str,
+        thickness_um: float,
+        thickness_mode: str,
+        failures: list[str],
+        tmax_unavailable: list[str],
+    ) -> str:
         lines = [
             f"Reference file: {reference_path}",
             f"Thickness: {thickness_um:g} um",
@@ -657,6 +777,15 @@ class FFTPlatformGUI(tk.Tk):
                 f"  Pair N: {len(sample_info.time)} | dt: {sample_info.dt:.8f} ps | pad: {sample_info.pad_length}",
                 f"  Window: start {sample_info.start_idx}, width {sample_info.width} | output rows: {len(result.transmittance)}",
             ])
+        lines.extend([
+            "",
+            f"Tmax trend band: {TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz",
+            "Sorted sample order (ascending frequency at Tmax):",
+        ])
+        for index, (sample_path, frequency, value) in enumerate(self.tmax_metrics, start=1):
+            lines.append(f"{index}. {sample_path.name}: Tmax={value:.6g} at {frequency:.6g} THz")
+        if tmax_unavailable:
+            lines.extend(["Tmax unavailable:", *[f"- {message}" for message in tmax_unavailable]])
         if failures:
             lines.extend(["", "Skipped files (error):", *[f"- {failure}" for failure in failures]])
         return "\n".join(lines) + "\n"
