@@ -10,13 +10,116 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from functions import AsymmetricTDSAnalyzer, find_transmittance_maximum
+from functions import AsymmetricTDSAnalyzer, find_transmittance_local_maxima, find_transmittance_maximum
 
 
 DEFAULT_REFERENCE = ""
 DEFAULT_SAMPLE_FOLDER = ""
 TMAX_FREQUENCY_MIN_THZ = 0.5
 TMAX_FREQUENCY_MAX_THZ = 2.5
+
+
+class LocalMaximaWindow(tk.Toplevel):
+    """Display local transmittance maxima for one or more analyzed samples."""
+
+    def __init__(self, parent: tk.Misc, spectra: list[tuple[Path, pd.DataFrame]]) -> None:
+        super().__init__(parent)
+        self.title("Transmittance local maxima")
+        self.geometry("1450x900")
+        self.minsize(1000, 650)
+        self.spectra = spectra
+        self.maxima_by_sample = [find_transmittance_local_maxima(frame) for _, frame in spectra]
+
+        root = ttk.Frame(self, padding=10)
+        root.pack(fill="both", expand=True)
+        # Long source filenames in the table notebook must not collapse the
+        # plot pane to zero width.
+        root.columnconfigure(0, weight=3, minsize=520)
+        root.columnconfigure(1, weight=2, minsize=360)
+        root.rowconfigure(0, weight=1)
+
+        plot_frame = ttk.Frame(root)
+        plot_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        plot_frame.rowconfigure(0, weight=1)
+        plot_frame.columnconfigure(0, weight=1)
+        table_frame = ttk.Frame(root)
+        table_frame.grid(row=0, column=1, sticky="nsew")
+        table_frame.rowconfigure(1, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            table_frame, text="Local-maximum coordinates", font=("Segoe UI", 11, "bold")
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.tables = ttk.Notebook(table_frame)
+        self.tables.grid(row=1, column=0, sticky="nsew")
+
+        self.figure = Figure(figsize=(9, 7), dpi=100, constrained_layout=True)
+        self.axis = self.figure.add_subplot(111)
+
+        for index, (sample_path, transmittance) in enumerate(spectra):
+            maxima = self.maxima_by_sample[index]
+            tab = ttk.Frame(self.tables, padding=6)
+            # A notebook computes its requested width from every tab label.
+            # Keep labels short and show the complete source name inside its
+            # table instead, so multiple selections leave room for the plot.
+            self.tables.add(tab, text=f"#{index + 1}")
+            ttk.Label(tab, text=sample_path.name, wraplength=330).grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 5)
+            )
+            tab.rowconfigure(1, weight=1)
+            tab.columnconfigure(0, weight=1)
+            table = ttk.Treeview(tab, columns=("number", "frequency", "transmittance"), show="headings")
+            table.heading("number", text="#")
+            table.heading("frequency", text="Frequency [THz]")
+            table.heading("transmittance", text="Transmittance")
+            table.column("number", width=45, anchor="center", stretch=False)
+            table.column("frequency", width=135, anchor="e")
+            table.column("transmittance", width=135, anchor="e")
+            scrollbar = ttk.Scrollbar(tab, orient="vertical", command=table.yview)
+            table.configure(yscrollcommand=scrollbar.set)
+            table.grid(row=1, column=0, sticky="nsew")
+            scrollbar.grid(row=1, column=1, sticky="ns")
+            for number, point in enumerate(maxima, start=1):
+                table.insert("", "end", values=(number, f"{point.frequency_thz:.8g}", f"{point.transmittance:.8g}"))
+            if not maxima:
+                table.insert("", "end", values=("-", "No local maxima", ""))
+
+        # Keep Python references for the lifetime of the Toplevel.  Without
+        # them Tk can retain an empty widget after Matplotlib's canvas object
+        # has been garbage-collected.
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.tables.bind("<<NotebookTabChanged>>", self._on_table_changed)
+        self._draw_selected_spectrum(0)
+        self.update_idletasks()
+        self.canvas.draw()
+
+    def _on_table_changed(self, _event=None) -> None:
+        selected_index = self.tables.index(self.tables.select())
+        self._draw_selected_spectrum(selected_index)
+        self.canvas.draw_idle()
+
+    def _draw_selected_spectrum(self, index: int) -> None:
+        """Draw only the sample selected in the coordinate-table tabs."""
+        sample_path, transmittance = self.spectra[index]
+        maxima = self.maxima_by_sample[index]
+        frequency = transmittance["freq"].to_numpy(dtype=float)
+        values = transmittance["mag"].to_numpy(dtype=float)
+        valid = np.isfinite(frequency) & np.isfinite(values)
+
+        self.axis.clear()
+        self.axis.plot(frequency[valid], values[valid], color="tab:blue", linewidth=1.45, label=sample_path.stem)
+        if maxima:
+            self.axis.scatter(
+                [point.frequency_thz for point in maxima],
+                [point.transmittance for point in maxima],
+                marker="x", color="crimson", s=62, linewidths=1.9, zorder=5, label="Local maxima",
+            )
+        self.axis.set_title(f"Local maxima — #{index + 1}: {sample_path.name}")
+        self.axis.set_xlabel("Frequency [THz]")
+        self.axis.set_ylabel("Transmittance")
+        self.axis.grid(True, alpha=0.3)
+        self.axis.legend(loc="best", fontsize=8)
 
 
 def export_tmax_metrics_to_excel(metrics: list[tuple[Path, float, float]], output_path: str | Path) -> pd.DataFrame:
@@ -64,6 +167,9 @@ class FFTPlatformGUI(tk.Tk):
         self.pad_value = tk.StringVar(value="4")
         self.crop_min = tk.StringVar(value="0.2")
         self.crop_max = tk.StringVar(value="3.0")
+        self.transmittance_y_mode = tk.StringVar(value="auto")
+        self.transmittance_y_min = tk.StringVar(value="0.0")
+        self.transmittance_y_max = tk.StringVar(value="1.0")
         # The analyzer uses centimetres internally; expose the more convenient
         # micrometre unit in the GUI.
         self.thickness_um = tk.StringVar(value="460")
@@ -144,10 +250,8 @@ class FFTPlatformGUI(tk.Tk):
         )
         row += 1
 
-        row = self._entry_row(row, "l (ps)", self.lower_bound)
-        row = self._entry_row(row, "u (ps)", self.upper_bound)
-        row = self._entry_row(row, "alpha1 (-)", self.alpha_1)
-        row = self._entry_row(row, "alpha2 (-)", self.alpha_2)
+        row = self._paired_entry_row(row, "l (ps)", self.lower_bound, "u (ps)", self.upper_bound)
+        row = self._paired_entry_row(row, "alpha1 (-)", self.alpha_1, "alpha2 (-)", self.alpha_2)
         row = self._entry_row(row, "Npad (× N)", self.pad_value)
 
         ttk.Label(self.control_frame, text="Pad mode").grid(row=row, column=0, sticky="w", pady=4)
@@ -161,8 +265,22 @@ class FFTPlatformGUI(tk.Tk):
         pad_combo.grid(row=row, column=1, sticky="ew", pady=4)
         row += 1
 
-        row = self._entry_row(row, "crop_min (THz)", self.crop_min)
-        row = self._entry_row(row, "crop_max (THz)", self.crop_max)
+        row = self._paired_entry_row(row, "crop_min (THz)", self.crop_min, "crop_max (THz)", self.crop_max)
+        ttk.Label(self.control_frame, text="T y-axis").grid(row=row, column=0, sticky="w", pady=4)
+        y_axis_frame = ttk.Frame(self.control_frame)
+        y_axis_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+        self.transmittance_y_mode_combo = ttk.Combobox(
+            y_axis_frame, textvariable=self.transmittance_y_mode,
+            values=("auto", "manual"), width=8, state="readonly",
+        )
+        self.transmittance_y_mode_combo.pack(side="left")
+        ttk.Label(y_axis_frame, text=" min").pack(side="left")
+        self.transmittance_y_min_entry = ttk.Entry(y_axis_frame, textvariable=self.transmittance_y_min, width=7)
+        self.transmittance_y_min_entry.pack(side="left", padx=(2, 0))
+        ttk.Label(y_axis_frame, text=" max").pack(side="left")
+        self.transmittance_y_max_entry = ttk.Entry(y_axis_frame, textvariable=self.transmittance_y_max, width=7)
+        self.transmittance_y_max_entry.pack(side="left", padx=(2, 0))
+        row += 1
         row = self._entry_row(row, "thickness (µm)", self.thickness_um)
 
         ttk.Label(self.control_frame, text="Thickness mode").grid(row=row, column=0, sticky="w", pady=4)
@@ -191,6 +309,11 @@ class FFTPlatformGUI(tk.Tk):
         row += 1
 
         ttk.Button(self.control_frame, text="Open fitting window", command=self._open_fitting_window).grid(
+            row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6)
+        )
+        row += 1
+
+        ttk.Button(self.control_frame, text="Show local maxima", command=self._open_local_maxima_window).grid(
             row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6)
         )
         row += 1
@@ -244,6 +367,18 @@ class FFTPlatformGUI(tk.Tk):
     def _entry_row(self, row: int, label: str, variable: tk.StringVar) -> int:
         ttk.Label(self.control_frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(self.control_frame, textvariable=variable, width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        return row + 1
+
+    def _paired_entry_row(
+        self, row: int, left_label: str, left_variable: tk.StringVar, right_label: str, right_variable: tk.StringVar
+    ) -> int:
+        """Place two compact labelled inputs on one control-panel row."""
+        frame = ttk.Frame(self.control_frame)
+        frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=4)
+        ttk.Label(frame, text=left_label).grid(row=0, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=left_variable, width=9).grid(row=0, column=1, sticky="w", padx=(3, 10))
+        ttk.Label(frame, text=right_label).grid(row=0, column=2, sticky="w")
+        ttk.Entry(frame, textvariable=right_variable, width=9).grid(row=0, column=3, sticky="w", padx=(3, 0))
         return row + 1
 
     def _browse_file(self, variable: tk.StringVar) -> bool:
@@ -338,6 +473,7 @@ class FFTPlatformGUI(tk.Tk):
 
         self.monitor_canvas = FigureCanvasTkAgg(self.monitor_figure, master=self.monitor_tab)
         self.monitor_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.monitor_canvas.mpl_connect("motion_notify_event", self._show_transmittance_cursor_coordinates)
 
         self.optical_canvas = FigureCanvasTkAgg(self.optical_figure, master=self.optical_tab)
         self.optical_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
@@ -361,6 +497,11 @@ class FFTPlatformGUI(tk.Tk):
     def _bind_events(self) -> None:
         self.active_sample_combo.bind("<<ComboboxSelected>>", self._on_active_sample_selected)
         self.view_notebook.bind("<<NotebookTabChanged>>", lambda _event: self._render_active_result())
+        self.transmittance_y_mode_combo.bind("<<ComboboxSelected>>", self._on_transmittance_y_mode_changed)
+        for entry in (self.transmittance_y_min_entry, self.transmittance_y_max_entry):
+            entry.bind("<Return>", self._on_transmittance_y_limits_changed)
+            entry.bind("<FocusOut>", self._on_transmittance_y_limits_changed)
+        self._update_transmittance_y_controls()
 
     def _on_active_sample_selected(self, _event) -> None:
         selected_name = self.active_sample_name.get().strip()
@@ -406,6 +547,51 @@ class FFTPlatformGUI(tk.Tk):
             self.status.set(f"Could not open fitting window: {exc}")
             messagebox.showerror("Transmittance fitting", str(exc))
 
+    def _open_local_maxima_window(self) -> None:
+        """Open a marked plot and coordinate table for the checked samples."""
+        selected_names = {path.name for path, selected in self.sample_checks if selected.get()}
+        spectra = [
+            (sample_path, result.transmittance)
+            for sample_path, result in self.results
+            if sample_path.name in selected_names
+        ]
+        if not spectra:
+            messagebox.showinfo("Local maxima", "Run the analysis and select at least one analyzed sample.")
+            return
+        try:
+            LocalMaximaWindow(self, spectra)
+        except Exception as exc:
+            self.status.set(f"Could not show local maxima: {exc}")
+            messagebox.showerror("Local maxima", str(exc))
+
+    def _on_transmittance_y_mode_changed(self, _event=None) -> None:
+        self._update_transmittance_y_controls()
+        self._render_active_result()
+
+    def _on_transmittance_y_limits_changed(self, _event=None) -> None:
+        if self.transmittance_y_mode.get() == "manual":
+            self._render_active_result()
+
+    def _update_transmittance_y_controls(self) -> None:
+        state = "!disabled" if self.transmittance_y_mode.get() == "manual" else "disabled"
+        self.transmittance_y_min_entry.state([state])
+        self.transmittance_y_max_entry.state([state])
+
+    def _apply_transmittance_y_limits(self) -> None:
+        if self.transmittance_y_mode.get() != "manual":
+            self.ax_t.set_ylim(bottom=0)
+            return
+        try:
+            lower = float(self.transmittance_y_min.get())
+            upper = float(self.transmittance_y_max.get())
+        except ValueError:
+            self.status.set("Manual T y-axis limits must be numbers.")
+            return
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            self.status.set("Manual T y-axis requires finite minimum < maximum.")
+            return
+        self.ax_t.set_ylim(lower, upper)
+
     def _style_monitor_axes(self) -> None:
         for ax in [self.ax_ref_td, self.ax_sample_td, self.ax_t]:
             ax.clear()
@@ -422,6 +608,25 @@ class FFTPlatformGUI(tk.Tk):
         self.ax_t.set_title("Transmittance")
         self.ax_t.set_xlabel("Frequency [THz]")
         self.ax_t.set_ylabel("Transmittance")
+        self._transmittance_hover_text = self.ax_t.text(
+            0.012, 0.98, "", transform=self.ax_t.transAxes, ha="left", va="top",
+            fontsize=9, bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "0.6", "alpha": 0.9},
+            visible=False, zorder=10,
+        )
+
+    def _show_transmittance_cursor_coordinates(self, event) -> None:
+        """Show the cursor's data-space coordinates while hovering over T(f)."""
+        label = getattr(self, "_transmittance_hover_text", None)
+        if label is None:
+            return
+        if event.inaxes is self.ax_t and event.xdata is not None and event.ydata is not None:
+            label.set_text(f"x = {event.xdata:.6g} THz\ny = {event.ydata:.6g}")
+            label.set_visible(True)
+        elif label.get_visible():
+            label.set_visible(False)
+        else:
+            return
+        self.monitor_canvas.draw_idle()
 
     def _style_optical_axes(self) -> None:
         for ax in [self.ax_n, self.ax_k, self.ax_alpha, self.ax_phase]:
@@ -629,7 +834,7 @@ class FFTPlatformGUI(tk.Tk):
                     label="Echo guideline",
                 )
 
-        self.ax_t.set_ylim(bottom=0)
+        self._apply_transmittance_y_limits()
         self.ax_ref_td.legend(loc="best", fontsize=8)
         self.ax_sample_td.legend(loc="best", fontsize=7)
         self.ax_t.legend(loc="best", fontsize=7)

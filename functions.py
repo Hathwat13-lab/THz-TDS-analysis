@@ -115,6 +115,14 @@ class TransmittanceMaximum:
 	transmittance: float
 
 
+@dataclass(frozen=True)
+class TransmittanceLocalMaximum:
+	"""One local maximum in a transmittance spectrum."""
+
+	frequency_thz: float
+	transmittance: float
+
+
 def load_time_domain_data(
 	file_path: str | Path,
 	skiprows: int | None = None,
@@ -492,6 +500,35 @@ def find_transmittance_maximum(
 		frequency_thz=float(frequency[peak_index]),
 		transmittance=float(magnitude[peak_index]),
 	)
+
+
+def find_transmittance_local_maxima(transmittance: pd.DataFrame) -> list[TransmittanceLocalMaximum]:
+	"""Return finite local maxima from a frequency-sorted transmittance table.
+
+	A maximum is higher than both adjacent finite points. The first and last
+	points are excluded, and no arbitrary smoothing threshold is imposed.
+	"""
+	if not {"freq", "mag"}.issubset(transmittance.columns):
+		raise ValueError("transmittance must contain 'freq' and 'mag' columns.")
+
+	frequency = transmittance["freq"].to_numpy(dtype=float)
+	magnitude = transmittance["mag"].to_numpy(dtype=float)
+	valid = np.isfinite(frequency) & np.isfinite(magnitude)
+	frequency = frequency[valid]
+	magnitude = magnitude[valid]
+	if len(frequency) < 3:
+		return []
+
+	order = np.argsort(frequency, kind="stable")
+	frequency = frequency[order]
+	magnitude = magnitude[order]
+	maximum_indices = np.flatnonzero(
+		(magnitude[1:-1] > magnitude[:-2]) & (magnitude[1:-1] > magnitude[2:])
+	) + 1
+	return [
+		TransmittanceLocalMaximum(float(frequency[index]), float(magnitude[index]))
+		for index in maximum_indices
+	]
 
 
 def build_frequency_axis(sample_rate: float, n_points: int) -> np.ndarray:
