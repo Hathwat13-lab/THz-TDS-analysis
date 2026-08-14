@@ -105,6 +105,7 @@ class AnalysisResult:
 	extinction: pd.DataFrame
 	refractive_index: pd.DataFrame
 	echo_guideline: dict[str, object] | None = None
+	fp_removal_info: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -562,6 +563,273 @@ def compute_optical_constants(
 	return alpha, k, n
 
 
+def film_fp_factor(
+	frequency_thz: np.ndarray,
+	n_film: float,
+	k_film: float,
+	thickness_um: float,
+	n_substrate: float = 1.0,
+	k_substrate: float = 0.0,
+) -> np.ndarray:
+	"""Complex Fabry-Perot ringing factor of a thin film on a substrate.
+
+	Standard single-layer TMM result for incidence from air (n=1) through a
+	film (index ``n_film - i k_film``, thickness ``thickness_um``) into a
+	semi-infinite substrate (index ``n_substrate - i k_substrate``, defaults
+	to air i.e. a free-standing film). This isolates just the film's own
+	multiple-internal-reflection contribution: dividing a measured complex
+	field-transmission spectrum by this factor removes the film's own etalon
+	ringing while leaving everything else (e.g. a metasurface resonance in
+	the substrate) untouched, since that resonance is not part of this
+	factor. The substrate index matters here — it sets the film/substrate
+	interface reflection ``r12``, which is generally different from the
+	air/film interface ``r01`` unless the substrate happens to be air too.
+	"""
+
+	thickness_cm = thickness_um * 1e-4
+	n_tilde = n_film - 1j * k_film
+	n_sub_tilde = n_substrate - 1j * k_substrate
+	r01 = (1 - n_tilde) / (1 + n_tilde)
+	r12 = (n_tilde - n_sub_tilde) / (n_tilde + n_sub_tilde)
+	delta = 2 * np.pi * frequency_thz * n_tilde * thickness_cm / SPEED_OF_LIGHT_CM_THZ
+	return 1.0 / (1.0 + r01 * r12 * np.exp(2j * delta))
+
+
+def _polynomial_baseline(x: np.ndarray, y: np.ndarray, degree: int) -> np.ndarray:
+	"""Fit a low-order polynomial baseline to (x, y) and evaluate it on x."""
+
+	valid = np.isfinite(x) & np.isfinite(y)
+	if np.count_nonzero(valid) <= degree:
+		return np.zeros_like(y)
+	coefficients = np.polyfit(x[valid], y[valid], degree)
+	return np.polyval(coefficients, x)
+
+
+def _notch_periodic_residual(
+	freq: np.ndarray,
+	residual: np.ndarray,
+	target_period_thz: float,
+	n_harmonics: int = 3,
+	relative_bandwidth: float = 0.25,
+) -> np.ndarray:
+	"""Remove the periodic component (and a few harmonics) near ``target_period_thz``.
+
+	``residual`` is assumed to already have any smooth (non-periodic) trend
+	removed and to live on a near-uniformly spaced ``freq`` axis. The Fourier
+	conjugate variable of frequency here is a time-like "quefrency" that, for
+	a true Fabry-Perot ripple, equals the film's round-trip time.
+	"""
+
+	n_points = len(freq)
+	if n_points < 8 or target_period_thz <= 0:
+		return residual
+	spacing = float(np.median(np.diff(freq)))
+	spectrum = np.fft.rfft(residual)
+	quefrency = np.fft.rfftfreq(n_points, d=spacing)
+	target_quefrency = 1.0 / target_period_thz
+	mask = np.zeros_like(quefrency, dtype=bool)
+	for harmonic in range(1, n_harmonics + 1):
+		center = harmonic * target_quefrency
+		mask |= np.abs(quefrency - center) <= relative_bandwidth * target_quefrency
+	spectrum[mask] = 0.0
+	return np.fft.irfft(spectrum, n_points)
+
+
+def remove_fp_ringing_spectral_notch(
+	transmittance: pd.DataFrame,
+	thickness_um: float,
+	n_film_guess: float,
+	baseline_degree: int = 3,
+	n_harmonics: int = 2,
+	relative_bandwidth: float = 0.12,
+) -> pd.DataFrame:
+	"""Tier 1: model-free removal of the film's periodic FP ripple.
+
+	Fits a smooth polynomial baseline to log-magnitude and (unwrapped) phase,
+	then notches out the periodic residual expected at the film's FP
+	round-trip frequency ``c / (2 * n_film_guess * thickness_um)``. Does not
+	require the film's true optical constants beyond a rough thickness/index
+	estimate, so it cannot distort a resonance that is far from that ripple
+	frequency, but a too-wide notch can smear closely spaced peaks.
+	"""
+
+	if thickness_um <= 0:
+		raise ValueError("thickness_um must be greater than zero.")
+	if not {"freq", "mag", "phase"}.issubset(transmittance.columns):
+		raise ValueError("transmittance must contain 'freq', 'mag', and 'phase' columns.")
+
+	freq = transmittance["freq"].to_numpy(dtype=float)
+	mag = transmittance["mag"].to_numpy(dtype=float)
+	phase = transmittance["phase"].to_numpy(dtype=float)
+
+	thickness_cm = thickness_um * 1e-4
+	target_period_thz = SPEED_OF_LIGHT_CM_THZ / (2 * n_film_guess * thickness_cm)
+
+	ln_mag = np.log(np.clip(mag, 1e-12, None))
+	baseline_ln_mag = _polynomial_baseline(freq, ln_mag, baseline_degree)
+	residual_ln_mag = ln_mag - baseline_ln_mag
+	filtered_residual_ln_mag = _notch_periodic_residual(
+		freq, residual_ln_mag, target_period_thz, n_harmonics, relative_bandwidth
+	)
+	corrected_mag = np.exp(baseline_ln_mag + filtered_residual_ln_mag)
+
+	baseline_phase = _polynomial_baseline(freq, phase, baseline_degree)
+	residual_phase = phase - baseline_phase
+	filtered_residual_phase = _notch_periodic_residual(
+		freq, residual_phase, target_period_thz, n_harmonics, relative_bandwidth
+	)
+	corrected_phase = baseline_phase + filtered_residual_phase
+
+	return pd.DataFrame({"freq": freq, "mag": corrected_mag, "phase": corrected_phase})
+
+
+def correct_fp_ringing_known_film(
+	transmittance: pd.DataFrame,
+	n_film: float,
+	k_film: float,
+	thickness_um: float,
+	n_substrate: float = 1.0,
+	k_substrate: float = 0.0,
+) -> pd.DataFrame:
+	"""Tier 2: divide out a known film's own FP ringing factor.
+
+	Reconstructs the measured complex field transmission from the stored
+	power transmittance (``mag``) and unwrapped field phase (``phase``),
+	divides it by :func:`film_fp_factor` for the supplied film parameters
+	(and substrate index, since the film's bottom interface reflects off the
+	substrate, not air), and returns the corrected power transmittance /
+	phase in the same schema. ``n_film``/``k_film`` are expected to be
+	roughly known ahead of time (literature value, ellipsometry, or a
+	separate measurement) rather than solved for here.
+	"""
+
+	if thickness_um <= 0:
+		raise ValueError("thickness_um must be greater than zero.")
+	if not {"freq", "mag", "phase"}.issubset(transmittance.columns):
+		raise ValueError("transmittance must contain 'freq', 'mag', and 'phase' columns.")
+
+	freq = transmittance["freq"].to_numpy(dtype=float)
+	mag = transmittance["mag"].to_numpy(dtype=float)
+	phase = transmittance["phase"].to_numpy(dtype=float)
+
+	fp_factor = film_fp_factor(freq, n_film, k_film, thickness_um, n_substrate, k_substrate)
+	fp_mag = np.abs(fp_factor)
+	fp_phase = np.unwrap(np.angle(fp_factor))
+
+	corrected_mag = mag / np.clip(fp_mag**2, 1e-12, None)
+	corrected_phase = phase - fp_phase
+	return pd.DataFrame({"freq": freq, "mag": corrected_mag, "phase": corrected_phase})
+
+
+def calibrate_fp_ringing(
+	transmittance: pd.DataFrame,
+	thickness_um: float,
+	n_film_init: float,
+	k_film_init: float = 0.0,
+	n_substrate: float = 1.0,
+	k_substrate: float = 0.0,
+	fit_n_k: bool = False,
+	baseline_degree: int = 3,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+	"""Tier 3: fit film FP parameters to minimize residual ringing power.
+
+	Starts from :func:`correct_fp_ringing_known_film` and uses
+	``scipy.optimize.least_squares`` to adjust the film thickness (and
+	optionally ``n_film``/``k_film``) so that the corrected log-magnitude has
+	as little leftover smooth-baseline residual as possible. This is a
+	calibration against the ringing itself, not a fit to any reference
+	curve, so it cannot invent or erase a real resonance far from the film's
+	own FP period.
+	"""
+
+	from scipy.optimize import least_squares
+
+	if thickness_um <= 0:
+		raise ValueError("thickness_um must be greater than zero.")
+
+	freq = transmittance["freq"].to_numpy(dtype=float)
+	spacing = float(np.median(np.diff(freq)))
+	n_points = len(freq)
+
+	def residual_for(params: np.ndarray) -> np.ndarray:
+		if fit_n_k:
+			d_um, n_film, k_film = params
+		else:
+			(d_um,) = params
+			n_film, k_film = n_film_init, k_film_init
+		corrected = correct_fp_ringing_known_film(transmittance, n_film, k_film, d_um, n_substrate, k_substrate)
+		ln_mag = np.log(np.clip(corrected["mag"].to_numpy(dtype=float), 1e-12, None))
+		baseline = _polynomial_baseline(freq, ln_mag, baseline_degree)
+		full_residual = ln_mag - baseline
+
+		# Only penalize the leftover power AT this candidate's own FP
+		# quefrency (± a narrow band), not the whole residual — the
+		# injected/real resonance is not periodic in frequency and must not
+		# be flattened away by this objective.
+		thickness_cm = d_um * 1e-4
+		target_period_thz = SPEED_OF_LIGHT_CM_THZ / (2 * n_film * thickness_cm)
+		target_quefrency = 1.0 / target_period_thz
+		spectrum = np.fft.rfft(full_residual)
+		quefrency = np.fft.rfftfreq(n_points, d=spacing)
+		isolated = np.zeros_like(spectrum)
+		band = np.abs(quefrency - target_quefrency) <= 0.15 * target_quefrency
+		isolated[band] = spectrum[band]
+		return np.fft.irfft(isolated, n_points)
+
+	# A candidate thickness whose FP period is comparable to (or wider than)
+	# the analyzed bandwidth is unresolvable: its "ringing" band in the
+	# quefrency-domain objective collides with the near-DC content the
+	# polynomial baseline already absorbs, creating a spurious low-cost
+	# attractor at unrealistically small thickness. Floor the search range
+	# so at least a few fringes are always resolvable.
+	bandwidth_thz = float(freq.max() - freq.min())
+	min_resolvable_um = 3 * SPEED_OF_LIGHT_CM_THZ / (2 * n_film_init * bandwidth_thz) * 1e4
+	d_lower = max(thickness_um * 0.5, min_resolvable_um)
+	d_upper = max(thickness_um * 1.5, d_lower * 1.05)
+
+	if fit_n_k:
+		initial = np.array([thickness_um, n_film_init, k_film_init], dtype=float)
+		lower = np.array([d_lower, 1.0, 0.0])
+		upper = np.array([d_upper, 10.0, 5.0])
+	else:
+		initial = np.array([thickness_um], dtype=float)
+		lower = np.array([d_lower])
+		upper = np.array([d_upper])
+	initial = np.clip(initial, lower, upper)
+
+	# The isolated-band objective is periodic/multimodal in thickness (many
+	# local minima from aliasing between the candidate and true FP period),
+	# so a gradient-based local optimizer easily gets stuck unless it starts
+	# near the true thickness. Do a coarse grid search over d first (holding
+	# n_film/k_film at their initial guess) and seed the local refinement
+	# from the best grid point instead of the raw user guess.
+	grid_d = np.linspace(d_lower, d_upper, 61)
+	grid_cost = [
+		float(np.sum(residual_for(np.array([d] if not fit_n_k else [d, n_film_init, k_film_init])) ** 2))
+		for d in grid_d
+	]
+	initial[0] = grid_d[int(np.argmin(grid_cost))]
+
+	fit = least_squares(residual_for, initial, bounds=(lower, upper))
+	if fit_n_k:
+		fitted_d_um, fitted_n, fitted_k = fit.x
+	else:
+		fitted_d_um = float(fit.x[0])
+		fitted_n, fitted_k = n_film_init, k_film_init
+
+	corrected = correct_fp_ringing_known_film(transmittance, fitted_n, fitted_k, fitted_d_um, n_substrate, k_substrate)
+	info = {
+		"thickness_um": float(fitted_d_um),
+		"n_film": float(fitted_n),
+		"k_film": float(fitted_k),
+		"n_substrate": float(n_substrate),
+		"k_substrate": float(k_substrate),
+		"fit_n_k": bool(fit_n_k),
+		"cost": float(fit.cost),
+	}
+	return corrected, info
+
+
 def find_absolute_peak(time: np.ndarray, amplitude: np.ndarray) -> tuple[int, float, float]:
 	"""Return the index, time, and amplitude of the largest absolute peak."""
 
@@ -756,6 +1024,12 @@ class AsymmetricTDSAnalyzer:
 		crop_max: float = 3.0,
 		thickness_cm: float = 0.0460,
 		thickness_mode: str = "thick",
+		fp_removal_method: str = "none",
+		film_n_guess: float = 1.5,
+		film_k_guess: float = 0.0,
+		substrate_n: float = 1.0,
+		substrate_k: float = 0.0,
+		fit_film_n_k: bool = False,
 	) -> AnalysisResult:
 		sample_aligned, reference_aligned = self.align_pair(sample_df, reference_df)
 		mode = thickness_mode.strip().lower()
@@ -784,6 +1058,41 @@ class AsymmetricTDSAnalyzer:
 			}
 		)
 
+		fp_removal_info: dict[str, object] | None = None
+		fp_method = fp_removal_method.strip().lower()
+		if mode == "thin" and fp_method != "none":
+			thickness_um = thickness_cm * 1e4
+			if fp_method == "spectral_notch":
+				transmittance = remove_fp_ringing_spectral_notch(
+					transmittance, thickness_um, film_n_guess
+				)
+				fp_removal_info = {"method": fp_method, "thickness_um": thickness_um, "n_film_guess": film_n_guess}
+			elif fp_method == "known_film":
+				transmittance = correct_fp_ringing_known_film(
+					transmittance, film_n_guess, film_k_guess, thickness_um,
+					n_substrate=substrate_n, k_substrate=substrate_k,
+				)
+				fp_removal_info = {
+					"method": fp_method,
+					"thickness_um": thickness_um,
+					"n_film": film_n_guess,
+					"k_film": film_k_guess,
+					"n_substrate": substrate_n,
+					"k_substrate": substrate_k,
+				}
+			elif fp_method == "auto_calibrate":
+				transmittance, calibration = calibrate_fp_ringing(
+					transmittance, thickness_um, film_n_guess, film_k_guess,
+					n_substrate=substrate_n, k_substrate=substrate_k, fit_n_k=fit_film_n_k,
+				)
+				fp_removal_info = {"method": fp_method, **calibration}
+			else:
+				raise ValueError(
+					"fp_removal_method must be one of 'none', 'spectral_notch', 'known_film', 'auto_calibrate'."
+				)
+			transmittance_mag = transmittance["mag"].to_numpy()
+			phase_difference = transmittance["phase"].to_numpy()
+
 		alpha, k, n = compute_optical_constants(sample_crop.frequency, transmittance_mag, phase_difference, thickness_cm)
 		absorption = pd.DataFrame({"freq": sample_crop.frequency, "alpha": alpha})
 		extinction = pd.DataFrame({"freq": sample_crop.frequency, "k": k})
@@ -801,4 +1110,5 @@ class AsymmetricTDSAnalyzer:
 			extinction=extinction,
 			refractive_index=refractive_index,
 			echo_guideline=echo_guideline,
+			fp_removal_info=fp_removal_info,
 		)

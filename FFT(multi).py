@@ -174,6 +174,14 @@ class FFTPlatformGUI(tk.Tk):
         # micrometre unit in the GUI.
         self.thickness_um = tk.StringVar(value="460")
         self.thickness_mode = tk.StringVar(value="thick")
+        self.fp_removal_method = tk.StringVar(value="none")
+        self.film_n_guess = tk.StringVar(value="1.5")
+        self.film_k_guess = tk.StringVar(value="0.0")
+        # Default matches high-resistivity Si, a common THz-TDS substrate;
+        # override for SiO2 (~1.95-2.1) or whatever the actual substrate is.
+        self.substrate_n_guess = tk.StringVar(value="3.42")
+        self.substrate_k_guess = tk.StringVar(value="0.0")
+        self.fit_film_n_k = tk.BooleanVar(value=False)
         self.echo_guideline_enabled = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self.active_sample_name = tk.StringVar(value="(none)")
@@ -288,6 +296,28 @@ class FFTPlatformGUI(tk.Tk):
         thickness_mode_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
         ttk.Radiobutton(thickness_mode_frame, text="thin (film)", value="thin", variable=self.thickness_mode).pack(side="left")
         ttk.Radiobutton(thickness_mode_frame, text="thick (pellet)", value="thick", variable=self.thickness_mode).pack(side="left", padx=(10, 0))
+        row += 1
+
+        ttk.Label(self.control_frame, text="FP removal (thin only)").grid(row=row, column=0, sticky="w", pady=4)
+        self.fp_removal_combo = ttk.Combobox(
+            self.control_frame,
+            textvariable=self.fp_removal_method,
+            values=("none", "spectral_notch", "known_film", "auto_calibrate"),
+            width=15,
+            state="readonly",
+        )
+        self.fp_removal_combo.grid(row=row, column=1, columnspan=2, sticky="ew", pady=4)
+        row += 1
+
+        row = self._paired_entry_row(row, "film n (guess)", self.film_n_guess, "film k (guess)", self.film_k_guess)
+        row = self._paired_entry_row(row, "substrate n", self.substrate_n_guess, "substrate k", self.substrate_k_guess)
+        fit_nk_frame = ttk.Frame(self.control_frame)
+        fit_nk_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        ttk.Checkbutton(
+            fit_nk_frame,
+            text="auto_calibrate also fits film n/k (not just thickness)",
+            variable=self.fit_film_n_k,
+        ).pack(side="left")
         row += 1
 
         echo_frame = ttk.Frame(self.control_frame)
@@ -966,6 +996,12 @@ class FFTPlatformGUI(tk.Tk):
             thickness_um = self._read_float(self.thickness_um, "thickness (µm)")
             thickness_mode = self.thickness_mode.get().strip().lower()
             thickness_cm = thickness_um * 1e-4
+            fp_removal_method = self.fp_removal_method.get().strip().lower()
+            film_n_guess = self._read_float(self.film_n_guess, "film n (guess)")
+            film_k_guess = self._read_float(self.film_k_guess, "film k (guess)")
+            substrate_n_guess = self._read_float(self.substrate_n_guess, "substrate n")
+            substrate_k_guess = self._read_float(self.substrate_k_guess, "substrate k")
+            fit_film_n_k = self.fit_film_n_k.get()
 
             if not reference_path:
                 raise ValueError("A reference file must be selected.")
@@ -975,6 +1011,8 @@ class FFTPlatformGUI(tk.Tk):
                 raise ValueError("thickness (µm) must be greater than zero.")
             if thickness_mode not in {"thin", "thick"}:
                 raise ValueError("Thickness mode must be either thin or thick.")
+            if fp_removal_method != "none" and thickness_mode != "thin":
+                raise ValueError("FP removal is only used in thin (film) mode. Set 'FP removal' to 'none' or switch to thin mode.")
 
             reference_df = self.analyzer.load_signal(reference_path)
             loaded_samples = []
@@ -1001,6 +1039,9 @@ class FFTPlatformGUI(tk.Tk):
                         alpha_1=alpha_1, alpha_2=alpha_2, pad_mode=pad_mode,
                         pad_value=pad_value, crop_min=crop_min, crop_max=crop_max,
                         thickness_cm=thickness_cm, thickness_mode=thickness_mode,
+                        fp_removal_method=fp_removal_method, film_n_guess=film_n_guess,
+                        film_k_guess=film_k_guess, substrate_n=substrate_n_guess,
+                        substrate_k=substrate_k_guess, fit_film_n_k=fit_film_n_k,
                     )
                     results.append((sample_path, result))
                 except Exception as exc:
@@ -1048,6 +1089,10 @@ class FFTPlatformGUI(tk.Tk):
                 f"  Pair N: {len(sample_info.time)} | dt: {sample_info.dt:.8f} ps | pad: {sample_info.pad_length}",
                 f"  Window: start {sample_info.start_idx}, width {sample_info.width} | output rows: {len(result.transmittance)}",
             ])
+            if result.fp_removal_info:
+                info = result.fp_removal_info
+                detail = ", ".join(f"{key}={value:.4g}" if isinstance(value, float) else f"{key}={value}" for key, value in info.items() if key != "method")
+                lines.append(f"  FP removal: {info['method']} ({detail})")
         lines.extend([
             "",
             f"Tmax trend band: {TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz",
