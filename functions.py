@@ -503,6 +503,42 @@ def find_transmittance_maximum(
 	)
 
 
+def find_transmittance_minimum(
+	transmittance: pd.DataFrame,
+	frequency_min_thz: float = 0.5,
+	frequency_max_thz: float = 2.5,
+) -> TransmittanceMaximum:
+	"""Return the smallest finite transmittance in the inclusive frequency band.
+
+	Mirrors find_transmittance_maximum but selects the in-band minimum instead.
+	"""
+	if frequency_min_thz > frequency_max_thz:
+		raise ValueError("frequency_min_thz must not exceed frequency_max_thz.")
+	if not {"freq", "mag"}.issubset(transmittance.columns):
+		raise ValueError("transmittance must contain 'freq' and 'mag' columns.")
+
+	frequency = transmittance["freq"].to_numpy(dtype=float)
+	magnitude = transmittance["mag"].to_numpy(dtype=float)
+	valid = (
+		np.isfinite(frequency)
+		& np.isfinite(magnitude)
+		& (frequency >= frequency_min_thz)
+		& (frequency <= frequency_max_thz)
+	)
+	if not np.any(valid):
+		raise ValueError(
+			f"No finite transmittance data is available in "
+			f"{frequency_min_thz:g}-{frequency_max_thz:g} THz."
+		)
+
+	indices = np.flatnonzero(valid)
+	trough_index = indices[int(np.argmin(magnitude[indices]))]
+	return TransmittanceMaximum(
+		frequency_thz=float(frequency[trough_index]),
+		transmittance=float(magnitude[trough_index]),
+	)
+
+
 def find_transmittance_local_maxima(transmittance: pd.DataFrame) -> list[TransmittanceLocalMaximum]:
 	"""Return finite local maxima from a frequency-sorted transmittance table.
 
@@ -529,6 +565,34 @@ def find_transmittance_local_maxima(transmittance: pd.DataFrame) -> list[Transmi
 	return [
 		TransmittanceLocalMaximum(float(frequency[index]), float(magnitude[index]))
 		for index in maximum_indices
+	]
+
+
+def find_transmittance_local_minima(transmittance: pd.DataFrame) -> list[TransmittanceLocalMaximum]:
+	"""Return finite local minima from a frequency-sorted transmittance table.
+
+	Mirrors find_transmittance_local_maxima but flips the comparison direction.
+	"""
+	if not {"freq", "mag"}.issubset(transmittance.columns):
+		raise ValueError("transmittance must contain 'freq' and 'mag' columns.")
+
+	frequency = transmittance["freq"].to_numpy(dtype=float)
+	magnitude = transmittance["mag"].to_numpy(dtype=float)
+	valid = np.isfinite(frequency) & np.isfinite(magnitude)
+	frequency = frequency[valid]
+	magnitude = magnitude[valid]
+	if len(frequency) < 3:
+		return []
+
+	order = np.argsort(frequency, kind="stable")
+	frequency = frequency[order]
+	magnitude = magnitude[order]
+	minimum_indices = np.flatnonzero(
+		(magnitude[1:-1] < magnitude[:-2]) & (magnitude[1:-1] < magnitude[2:])
+	) + 1
+	return [
+		TransmittanceLocalMaximum(float(frequency[index]), float(magnitude[index]))
+		for index in minimum_indices
 	]
 
 
@@ -584,6 +648,17 @@ def film_fp_factor(
 	factor. The substrate index matters here — it sets the film/substrate
 	interface reflection ``r12``, which is generally different from the
 	air/film interface ``r01`` unless the substrate happens to be air too.
+
+	Sign convention matches the rest of this module (see
+	``compute_optical_constants``): the sample-relative-to-reference
+	transmission is modelled as ``exp(-i(n~-1) * omega * d / c)`` with
+	``n~ = n - i k`` and ``k >= 0`` for an absorbing medium, so the one-way
+	propagation phase used below is ``exp(-i * n~ * omega * d / c)`` (note
+	the minus sign) -- getting this sign backwards makes the round-trip term
+	grow instead of decay with increasing ``k_film``, which was caught by
+	checking that ``abs(film_fp_factor)`` stays bounded as ``k_film``
+	increases (it must approach 1, since a strongly absorbing film cannot
+	sustain multiple internal reflections).
 	"""
 
 	thickness_cm = thickness_um * 1e-4
@@ -592,7 +667,7 @@ def film_fp_factor(
 	r01 = (1 - n_tilde) / (1 + n_tilde)
 	r12 = (n_tilde - n_sub_tilde) / (n_tilde + n_sub_tilde)
 	delta = 2 * np.pi * frequency_thz * n_tilde * thickness_cm / SPEED_OF_LIGHT_CM_THZ
-	return 1.0 / (1.0 + r01 * r12 * np.exp(2j * delta))
+	return 1.0 / (1.0 + r01 * r12 * np.exp(-2j * delta))
 
 
 def _polynomial_baseline(x: np.ndarray, y: np.ndarray, degree: int) -> np.ndarray:

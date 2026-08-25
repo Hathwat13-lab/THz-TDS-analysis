@@ -1,42 +1,190 @@
-# Thin-film FP ringing 제거 가이드
+# Thin-film FP ringing 제거 — 검증 가이드
 
-## 구현 범위
+이 문서의 목적은 "동작하는 것 같다"가 아니라 **당신이 직접, 코드와 물리식을
+대조해가며 맞는지 틀렸는지 판단할 수 있게** 하는 것이다. 그래서 순서를 이렇게
+잡았다: (1) 지금 상태 요약, (2) TMM 공식이 어디서 왔는지 처음부터 유도, (3)
+`functions.py`에서 바뀐 것 전부, (4) 세 가지 방법의 코드, (5) 직접 재현 가능한
+검증 스크립트와 체크리스트.
 
-이번 작업은 **`thickness_mode = "thin (film)"`일 때 transmittance에 남는 Fabry–Pérot
-(FP) 링잉을 제거하는 기능**만 구현한다. 그 외의 것은 이번 변경에 포함되지 않는다:
+## 1. 지금 상태 (요약)
 
-- 메타표면(패턴된 Au)의 공명 응답 자체를 TMM/RCWA로 시뮬레이션하는 기능은 없다.
-  기존 워크플로처럼 "substrate+Au"를 reference로, "substrate+Au+film"을 sample로
-  측정한 비율을 그대로 쓴다 — 메타표면 응답은 측정으로 이미 반영되어 있으므로
-  모델링 대상이 아니다.
-- substrate(SiO2, Si)의 광학상수를 새로 추출하는 기능은 없다. **다만 substrate의
-  n, k는 입력값으로 반드시 필요하다** (아래 버그/수정 참고) — 대략적인 문헌값을
-  직접 입력해야 한다.
-- `n(ω), k(ω)`를 자유형(free-form)으로 역산하는 기능은 **의도적으로** 넣지 않았다
-  (아래 "왜 자유형 n,k 역산을 안 했는가" 참고).
-
-즉 이번 기능은 "필름 자신의 내부 반사가 만드는 주기적 ripple을 transmittance에서
-제거"하는 것이 전부다.
-
-## 발견하고 고친 버그: substrate를 공기로 취급했었음
-
-**Tier 2/3(`known_film`, `auto_calibrate`)가 TMM에 기반한 건 맞지만, 처음 구현에서
-필름을 "공기 중에 떠 있는 필름"으로 취급하는 실수를 했다.** 실제 샘플은 필름이
-공기 위가 아니라 substrate(Si, SiO2) 위에 있으므로 이건 잘못된 경계조건이다.
-
-표준 단일층 TMM 공식(medium 0=공기, 1=필름, 2=substrate)은
+리뷰 과정에서 **버그를 두 개 찾았고 둘 다 고쳤다.** 하나는 이미 커밋(`0db56d8`)에
+들어가 있고, 하나는 아직 **커밋 전 working tree 상태**로 남아 있다 — 당신이
+직접 diff를 보고 판단한 뒤 커밋 여부를 정하라고 일부러 남겨뒀다.
 
 ```
-t = t01 * t12 * exp(iδ) / (1 + r01*r12*exp(2iδ))
-r01 = (n0-ñ1)/(n0+ñ1),  r12 = (ñ1-n2)/(ñ1+n2)
+git log --oneline -1                 # 0db56d8 Add thin-film Fabry-Perot ringing removal (3 tiers)
+git diff -- functions.py             # 커밋 안 된 부분: 부호 버그 수정 (아래 1.2)
 ```
 
-인데, 처음 구현에서는 `r12 = -r01`(즉 n2=n0=공기인 경우에만 성립하는 특수해)로
-암묵적으로 가정해서 `1/(1 - r01²·e^{2iδ})`를 썼다. `n2`(substrate)가 공기가 아니면
-`r12 ≠ -r01`이라 이 식 자체가 틀린다. GUI에도 substrate n/k를 입력할 곳이 아예
-없었다 — 물리 파라미터가 통째로 빠진 상태였다.
+### 1.1. (커밋됨) substrate를 공기로 취급한 버그
 
-**고친 후 (`functions.py`, 실제 코드):**
+필름이 실제로는 substrate(Si/SiO2) 위에 있는데, 처음 구현은 필름을 "공기 중에
+뜬 필름"으로 취급하는 특수식을 썼다. `film_fp_factor`에 `n_substrate`/`k_substrate`
+파라미터를 추가하고 공식을 일반화해서 고쳤다 (§2, §3.2 참고).
+
+### 1.2. (아직 커밋 안 됨) 흡수 부호가 반대였던 버그
+
+이건 이번에 검증 가이드를 쓰다가 "TMM이 진짜 맞나" 다시 손으로 유도해보면서
+새로 찾은 것이다. 물리적으로 당연한 성질 하나를 코드가 만족하는지 직접 찍어봤다:
+
+> **필름의 흡수(`k_film`)가 커질수록, 필름 내부에서 빛이 여러 번 왕복하는 게
+> 물리적으로 점점 더 불가능해지므로, ringing factor의 크기는 1로 수렴해야
+> 한다 (즉 ringing이 사라져야 한다).**
+
+```python
+# 실제로 돌려본 것
+for k_film in [0.0, 0.2, 0.5, 1.0, 3.0]:
+    fp = film_fp_factor(freq, 1.6, k_film, 150.0, n_substrate=3.42, k_substrate=0.0)
+    print(np.min(np.abs(fp)), np.max(np.abs(fp)))
+```
+
+| k_film | 수정 전 `\|fp\|` 범위 | 수정 후 `\|fp\|` 범위 |
+| --- | --- | --- |
+| 0.0 | [0.923, 1.072] | [0.923, 1.072] (동일) |
+| 0.2 | [0.328, 1.477] | [0.981, 1.019] |
+| 0.5 | [0.004, 0.824] | [0.990, 1.003] |
+| 1.0 | [0.0000, 0.228] | [0.998, 1.000] |
+| 3.0 | [0.0000, 0.0002] | [1.000, 1.000] |
+
+수정 전 코드는 흡수가 커질수록 **오히려 분모가 0에 가까워져서**(어떤
+주파수에서는 correction factor가 거의 무한대가 됨 — 나누면 결과가 폭발함)
+물리적으로 거꾸로 갔다. 원인은 전파 위상의 부호: 이 파일 전체(기존
+`compute_optical_constants`가 암묵적으로 쓰는 관례)는
+
+```
+H(ω) ∝ exp(-i(ñ-1)ωd/c),  ñ = n - ik  (k≥0가 흡수)
+```
+
+를 쓰는데, `film_fp_factor`의 왕복 위상 항은 `exp(+2iδ)`(플러스 부호)로 짜여
+있었다 — 부호가 반대라 `k_film`이 커질수록 감쇠 대신 증폭이 걸렸다. 고친 diff는
+이 한 줄뿐이다:
+
+```diff
+- return 1.0 / (1.0 + r01 * r12 * np.exp(2j * delta))
++ return 1.0 / (1.0 + r01 * r12 * np.exp(-2j * delta))
+```
+
+**중요**: 이 부호는 `k_film`이 작을 때는(예: 검증에 쓴 0.02) 오차가 작아서
+합성 데이터 검증 결과에 큰 영향을 안 줬다 — 그래서 처음엔 못 잡았다. 흡수가 큰
+필름(k가 0.2 이상)에 `known_film`/`auto_calibrate`를 그대로 썼다면 결과가 크게
+틀어졌을 것이다.
+
+## 2. TMM 공식은 어디서 왔는가 (직접 유도, 외부 라이브러리 없음)
+
+**이 프로젝트는 어떤 TMM/MTMM 오픈소스 코드도 참조하거나 복사하지 않았다.**
+아래는 표준 광학 교과서(Hecht, *Optics*; Born & Wolf, *Principles of Optics*;
+Macleod, *Thin-Film Optical Filters*)에 나오는 단일층 박막 간섭(Airy 공식)을
+그대로 손으로 다시 유도한 것이다 — 아무 교과서나 펴서 대조해볼 수 있다.
+
+**설정**: 평면파가 수직 입사. z<0: 공기(n0=1). 0<z<d: 필름(ñ1 = n_film - i·k_film).
+z>d: substrate(ñ2 = n_substrate - i·k_substrate).
+
+**계면에서의 Fresnel 진폭 계수** (수직 입사):
+
+```
+r_ab = (n_a - n_b) / (n_a + n_b)      t_ab = 2 n_a / (n_a + n_b)
+```
+
+**유도**: z=0에서 투과한 진폭은 `t01`. 필름을 한 번 지나면서 위상
+`exp(iδ)`(δ = ñ1·ω·d/c)을 얻는다. z=d에서 일부는 그대로 투과(`t12`)해서 나가고
+(0차 항: `t01·t12·exp(iδ)`), 나머지는 반사(`r12`)해서 되돌아가 필름을 한 번 더
+지나고(`exp(iδ)`), z=0 안쪽 면에서 반사(`r10 = -r01`, Stokes relation)한 뒤 다시
+필름을 지나(`exp(iδ)`) z=d에서 또 일부가 투과한다. 왕복 한 번마다
+`r10·r12·exp(2iδ)` 배가 곱해지는 등비급수이므로:
+
+```
+t_total = t01·t12·exp(iδ) · Σ_{m=0}^∞ [r10·r12·exp(2iδ)]^m
+        = t01·t12·exp(iδ) / (1 - r10·r12·exp(2iδ))
+        = t01·t12·exp(iδ) / (1 + r01·r12·exp(2iδ))      (∵ r10 = -r01)
+```
+
+이건 어느 광학 교과서에도 나오는 표준 결과다(예: Hecht *Optics* 5판, "Multiple
+Reflections in a Film"). 분자 `t01·t12·exp(iδ)`는 주파수에 따라 완만하게만
+변하는(주기적 진동이 없는) 항이고, **주기적 ringing은 전부 분모
+`(1 + r01·r12·exp(2iδ))⁻¹`에서 나온다** — 그래서 `film_fp_factor`는 분자를
+버리고 분모(의 역수)만 계산한다. 즉 "필름이 얹혀서 생긴 추가적인 등비급수
+간섭 성분만" 분리해내는 것이지, 전체 투과율 자체를 계산하는 게 아니다.
+
+**부호 관례**: 이 프로젝트는 `exp(+iδ)`가 아니라 `exp(-iδ)`를 순방향 전파
+위상으로 쓴다(§1.2). 이건 순전히 시간 관례(`exp(-iωt)` vs `exp(+iωt)`) 선택의
+문제라 어느 쪽이든 자기 일관적이면 되는데, **기존에 이미 있던
+`compute_optical_constants`(내가 건드리지 않은 코드)가 이미 `exp(-i(ñ-1)ωd/c)`
+관례를 쓰고 있었으므로 거기에 맞춘 것**이다. 이 부호를 반대로 짜면 위 표처럼
+흡수가 감쇠가 아니라 증폭으로 나온다.
+
+### 2.1. 손으로/코드로 바로 확인할 수 있는 성질들
+
+| 성질 | 검증 방법 |
+| --- | --- |
+| `n_substrate == n_film` → `r12=0` → `film_fp_factor ≡ 1` (ringing 없음) | 아래 스크립트 `assert` 참고. 계면이 없으면 반사도 없다는 당연한 성질. |
+| `n_substrate = 1, k_substrate = 0` → `r12 = -r01`이 되어 `factor = 1/(1 + r01·(-r01)·exp(-2iδ)) = 1/(1 - r01²·exp(-2iδ))` | free-standing film의 특수해로 정확히 환원되는지 직접 대수로 계산해볼 수 있다. |
+| `k_film` 증가 → `\|film_fp_factor\|` → 1로 수렴 (진동 폭이 줄어듦) | §1.2 표. |
+| ringing의 주파수 주기는 `Δf = c / (2·n_film·d)` (substrate와 무관) | `exp(∓2iδ)`의 실수부만 주기성을 결정하고, 그 계수가 `n_film`에만 의존하기 때문. `remove_fp_ringing_spectral_notch`/`calibrate_fp_ringing`이 이 식을 그대로 쓴다. |
+
+## 3. `functions.py`에서 바뀐 것 전부
+
+`git diff 369702d2 HEAD -- functions.py`(이번 기능 커밋 직전 대비)를 그대로
+확인했고, **삭제되거나 수정된 기존 줄은 단 하나도 없다 — 전부 순수 추가(append)다.**
+직접 확인하려면:
+
+```
+git diff 369702d2 HEAD -- functions.py | grep '^-'
+# 출력이 "--- a/functions.py" 한 줄뿐이면 기존 코드가 안 건드려졌다는 뜻
+```
+
+### 3.1. `AnalysisResult` (dataclass, 기존 코드 근처)
+
+- `fp_removal_info: dict[str, object] | None = None` 필드 **추가만** 됨. 기존
+  필드(`transmittance`, `refractive_index` 등) 순서/이름 변화 없음.
+
+### 3.2. 새 함수 (전부 신규, 기존 함수 옆에 추가됨)
+
+| 함수 | 역할 | 줄 수 |
+| --- | --- | --- |
+| `film_fp_factor(freq, n_film, k_film, d_um, n_substrate=1.0, k_substrate=0.0)` | §2의 TMM 공식. 모든 티어가 공유하는 유일한 물리 primitive. | ~20줄 |
+| `_polynomial_baseline(x, y, degree)` | `np.polyfit`/`np.polyval` 감싼 헬퍼. "완만한 배경"과 "주기적 ringing"을 분리하는 데 공통으로 씀. | ~7줄 |
+| `_notch_periodic_residual(freq, residual, target_period_thz, ...)` | residual을 FFT해서 목표 주기(및 배음) 근처 성분만 0으로 지우고 역변환. Tier 1에서만 씀 (Tier 3은 비슷한 로직을 목적함수 안에 별도로 인라인했다 — 완전히 재사용은 안 됨, 아래 참고). | ~15줄 |
+| `remove_fp_ringing_spectral_notch(...)` | **Tier 1**. TMM 아님, 순수 신호처리. | ~25줄 |
+| `correct_fp_ringing_known_film(...)` | **Tier 2**. `film_fp_factor`로 대수적 나눗셈. | ~20줄 |
+| `calibrate_fp_ringing(...)` | **Tier 3**. Tier 2 + `scipy.optimize.least_squares`로 두께(옵션 n,k) 자동 보정. | ~65줄 |
+
+### 3.3. `AsymmetricTDSAnalyzer.analyze_pair()` (기존 메서드, 확장만 됨)
+
+- 시그니처에 키워드 인자 6개 추가: `fp_removal_method="none"`, `film_n_guess=1.5`,
+  `film_k_guess=0.0`, `substrate_n=1.0`, `substrate_k=0.0`, `fit_film_n_k=False`.
+  전부 default가 있어서 **기존 호출 코드(`history/FFT(thick).py` 포함)는 전혀
+  안 바뀐 것처럼 동작한다** (기본값이 전부 "아무것도 안 함"에 해당).
+- 기존의 transmittance 계산(`transmittance_mag`, `phase_difference` 산출부)과
+  `compute_optical_constants` 호출 사이에 28줄짜리 블록이 새로 끼어들었다:
+  `thickness_mode == "thin"`이고 `fp_removal_method != "none"`일 때만 위 세
+  함수 중 하나를 호출해서 `transmittance`를 덮어쓴다. **`thick` 모드거나
+  `fp_removal_method="none"`이면 이 블록은 아예 실행되지 않는다** (§4.2에서
+  직접 실행해서 확인 가능).
+- 반환값 `AnalysisResult(...)`에 `fp_removal_info=fp_removal_info` 인자 추가.
+
+### 3.4. 건드리지 않은 것 (functions.py 안에서)
+
+`compute_optical_constants`, `preprocess_thin`/`preprocess_thick`(여전히 서로
+동일한 windowing 로직 — 이번 변경은 windowing을 안 바꿨다), `build_echo_guideline`,
+`compute_echo_guideline`, FFT/윈도우/스펙트럼 관련 모든 함수, `AsymmetricTDSAnalyzer`의
+나머지 메서드. 전부 원본 그대로.
+
+### 3.5. `FFT(multi).py`에서 바뀐 것 (요약, `functions.py`가 아니라 GUI 쪽)
+
+- `self.fp_removal_method`, `self.film_n_guess`, `self.film_k_guess`,
+  `self.substrate_n_guess`(기본 3.42=Si), `self.substrate_k_guess`(기본 0.0),
+  `self.fit_film_n_k` — `StringVar`/`BooleanVar` 추가.
+- 컨트롤 패널에 콤보박스 1개 + `_paired_entry_row` 2줄 + 체크박스 1개 추가.
+- `run_analysis()`에서 이 값들을 읽어서 `analyze_pair()`로 키워드 전달.
+  `thick` 모드에서 FP removal이 `none`이 아니면 에러 발생시키는 유효성 검사 추가.
+- `_format_multi_summary`에 `fp_removal_info` 출력 줄 추가.
+- 그 외 플로팅 코드(`_render_active_result` 등)는 안 건드림 — `result.transmittance`를
+  그대로 그리는 기존 구조라 자동으로 보정된 곡선을 받는다.
+
+## 4. 세 가지 방법의 실제 코드 (최신, 방금 확인한 버전과 동일)
+
+공통 물리 primitive:
 
 ```python
 def film_fp_factor(frequency_thz, n_film, k_film, thickness_um, n_substrate=1.0, k_substrate=0.0):
@@ -46,53 +194,14 @@ def film_fp_factor(frequency_thz, n_film, k_film, thickness_um, n_substrate=1.0,
     r01 = (1 - n_tilde) / (1 + n_tilde)
     r12 = (n_tilde - n_sub_tilde) / (n_tilde + n_sub_tilde)
     delta = 2 * np.pi * frequency_thz * n_tilde * thickness_cm / SPEED_OF_LIGHT_CM_THZ
-    return 1.0 / (1.0 + r01 * r12 * np.exp(2j * delta))
+    return 1.0 / (1.0 + r01 * r12 * np.exp(-2j * delta))   # 부호 수정 반영(§1.2)
 ```
 
-`n_substrate=1.0`(공기)이면 예전 공식으로 정확히 환원되니, 자유필름(free-standing)
-케이스는 그대로 특수해로 남아있다. `correct_fp_ringing_known_film`,
-`calibrate_fp_ringing`, `analyze_pair()`, GUI까지 전부 `n_substrate`/`k_substrate`를
-받아서 여기로 흘려보내도록 고쳤다. GUI에는 **substrate n / substrate k** 입력칸이
-새로 생겼고 기본값은 Si(3.42, 0.0) — SiO2를 쓰면 ~1.95–2.1로 바꿔줘야 한다.
+### Tier 1 — `spectral_notch` (TMM 아님, 순수 신호처리)
 
-**이 버그가 실제로 얼마나 위험했는지 (합성 데이터로 재현)**: 필름을 Si 기판(n=3.42)
-위에 올려놓고 ringing을 주입한 뒤, (a) 예전처럼 공기로 잘못 가정하고 보정 vs
-(b) 올바른 substrate 인덱스로 보정을 비교:
-
-```
-method                                          ringing RMS  ringing cut   res. depth  depth err
-Tier 2 known_film (WRONG: air substrate)            0.23032      -64.0%     -0.09606     308.0%
-Tier 2 known_film (correct substrate)               0.01120       92.0%      0.04618       0.0%
-```
-
-잘못된 가정으로 보정하면 ringing이 **줄어드는 게 아니라 64% 더 커지고**, 공명
-depth 오차는 308%(부호까지 반전)로 완전히 망가진다 — "근본적으로 위험하다"는
-지적이 정확했다. Substrate 인덱스를 올바르게 주면 ringing 92% 감소, depth 오차
-0%로 정상 동작한다.
-
-## 왜 자유형 n,k 역산을 안 했는가
-
-패턴된 Au 공진기의 공명(Rabi splitting)은 필름이 그 위에 올라가면서 생기는
-**진짜 신호**이지, 제거해야 할 노이즈가 아니다. 만약 각 주파수에서 자유롭게
-`n(ω), k(ω)`를 풀어버리면, 그 역산 과정이 공진기의 공명 자체를 "필름의 굴절률
-구조"로 오인해서 흡수해버릴 위험이 크다. 그래서 세 가지 방법 모두
-**필름 자신의 FP factor만**을 대상으로 하고, 그 외의 스펙트럼 구조(공명 포함)는
-건드리지 않도록 설계했다.
-
-## 세 가지 방법 (rigor 순서)
-
-공통 물리 primitive는 위 `functions.film_fp_factor`. 세 방법 모두 이 factor를
-어떻게 얻고 어떻게 나눠주는지에서만 차이가 난다.
-
-### Tier 1 — `spectral_notch` (모델 불필요, TMM 아님)
-
-**이 방법은 TMM과 무관하다** — 순수 신호처리다. 이미 계산된 transmittance의
-`ln(mag)`와 `phase`에 저차 다항식 baseline을 맞추고, 남은 residual을 주파수축
-FFT("quefrency" 도메인)에서 봤을 때 필름의 예상 round-trip 주파수
-(`Δf ≈ c / (2 n d)`) 근처만 notch로 제거한다. substrate 정보 없이 두께 어림값만
-있으면 된다 (ringing의 "주기"는 substrate와 무관하게 필름 자신의 왕복 광로만으로
-정해지기 때문). 가장 가볍지만 무딘 도구 — notch 폭이 넓으면 진짜 공명도 같이
-깎여나간다 (검증 스크립트 기준 약 19~36% 정도 depth 손실).
+이미 계산된 transmittance의 `ln(mag)`, `phase`에 저차 다항식 baseline을 맞추고,
+남은 residual을 FFT해서 필름의 예상 round-trip 주기(`Δf ≈ c/(2·n·d)`) 근처만
+지운다. substrate 정보 불필요 (주기가 substrate와 무관하므로).
 
 ```python
 def _notch_periodic_residual(freq, residual, target_period_thz, n_harmonics=3, relative_bandwidth=0.25):
@@ -129,13 +238,10 @@ def remove_fp_ringing_spectral_notch(transmittance, thickness_um, n_film_guess,
     return pd.DataFrame({"freq": freq, "mag": corrected_mag, "phase": corrected_phase})
 ```
 
-### Tier 2 — `known_film` (TMM, 알려진 필름+substrate 파라미터로 대수적 보정)
+### Tier 2 — `known_film` (TMM, 대수적 나눗셈)
 
-필름의 n, k, 두께, 그리고 **substrate의 n, k**가 어느 정도 알려져 있다는
-전제(문헌값, ellipsometry, 또는 별도 측정)로 `film_fp_factor`를 계산해서 측정된
-복소 transmission에서 바로 나눠버린다. `mag`는 파워 투과율(`|t|^2`)이라 factor의
-크기는 제곱해서 나누고, `phase`는 unwrap된 field 위상이라 factor의 unwrap된
-위상을 그대로 빼준다. 피팅이 아니라 대수적 나눗셈이라 빠르고 결정론적이다.
+`mag`는 파워 투과율(`|t|²`)이라 factor 크기를 제곱해서 나누고, `phase`는 unwrap된
+field 위상이라 factor의 unwrap 위상을 그대로 뺀다.
 
 ```python
 def correct_fp_ringing_known_film(transmittance, n_film, k_film, thickness_um, n_substrate=1.0, k_substrate=0.0):
@@ -152,31 +258,12 @@ def correct_fp_ringing_known_film(transmittance, n_film, k_film, thickness_um, n
     return pd.DataFrame({"freq": freq, "mag": corrected_mag, "phase": corrected_phase})
 ```
 
-파라미터(필름과 substrate 둘 다)가 정확하면 ringing을 거의 완벽하게 제거한다
-(검증 결과 참고). substrate를 틀리면 위 "버그" 절에서 보듯 결과가 오히려 나빠질
-수 있으므로 **아무 값이나 넣지 말고 실제 substrate 재질에 맞는 값을 넣어야 한다.**
+### Tier 3 — `auto_calibrate` (TMM + ringing 최소화 피팅)
 
-### Tier 3 — `auto_calibrate` (TMM + ringing 최소화로 두께 자동 보정)
-
-Tier 2와 같은 공식을 쓰되(substrate n,k는 여전히 입력값으로 고정), 필름 두께
-(옵션으로 n,k도)를 `scipy.optimize.least_squares`로 조정해서 **보정 후 남은
-ringing 전력을 최소화**한다. 어떤 "정답" 곡선에 맞추는 게 아니라 ringing 자체를
-줄이는 방향으로 캘리브레이션하는 것이므로, 필름 FP 주기와 무관한 진짜 공명을
-지우거나 만들어내지 않는다.
-
-구현상 중요한 디테일 두 가지 (둘 다 검증 스크립트 실행 중 실제로 실패를 보고
-고친 것):
-
-1. **목적함수는 residual 전체가 아니라 후보 두께가 만드는 FP quefrency 근처
-   대역의 전력만** 최소화한다 (`band = |quefrency - target_quefrency| <= 0.15 *
-   target_quefrency`). 처음엔 residual 전체(`ln_mag - baseline`)를 그대로
-   least_squares에 넘겼는데, 그러면 옵티마이저가 진짜 공명(주기적이지 않은
-   feature)까지 납작하게 눌러서 depth 오차가 135~216%까지 치솟는 걸 확인했다.
-2. **두께 탐색 범위 하한을 "몇 개 fringe가 실제로 보일 만큼" 강제**하고
-   (`min_resolvable_um`), 그 범위 안에서 **coarse grid로 먼저 최적 시작점을
-   찾은 뒤** local least_squares를 돌린다. 이 목적함수는 두께에 대해
-   multi-modal(여러 local minimum)이라 grid presearch 없이 gradient 기반
-   local optimizer만 돌리면 엉뚱한 두께에 갇히는 것도 확인했다.
+두께(옵션 n,k)를 `scipy.optimize.least_squares`로 조정해서 **보정 후 남은 ringing
+전력만** 최소화한다 (전체 residual을 쓰면 진짜 공명까지 눌러버리는 걸 확인하고
+고쳤음 — depth 오차가 135~216%까지 치솟는 걸 봤다). 목적함수는 두께에 대해
+multi-modal이라 coarse grid로 먼저 시작점을 찾는다.
 
 ```python
 def residual_for(params):
@@ -200,7 +287,7 @@ def residual_for(params):
     isolated[band] = spectrum[band]
     return np.fft.irfft(isolated, n_points)
 
-# resolvability floor + coarse grid presearch before least_squares:
+# 두께 탐색 하한을 "몇 개 fringe가 실제로 보일 만큼"으로 강제 + coarse grid presearch
 bandwidth_thz = float(freq.max() - freq.min())
 min_resolvable_um = 3 * SPEED_OF_LIGHT_CM_THZ / (2 * n_film_init * bandwidth_thz) * 1e4
 d_lower = max(thickness_um * 0.5, min_resolvable_um)
@@ -211,133 +298,129 @@ initial[0] = grid_d[int(np.argmin(grid_cost))]
 fit = least_squares(residual_for, initial, bounds=(lower, upper))
 ```
 
-`fit_n_k=True`로 n,k까지 같이 풀면 두께-굴절률 사이에 degeneracy가 있어 정확도가
-떨어진다 (검증: 참값 `d=150, n=1.6` → 복원값 `d=132, n=1.41`). 기본값은
-`False`(두께만 보정)이고, 이쪽이 더 안정적이다.
+`fit_n_k=True`는 두께-굴절률 degeneracy 때문에 부정확해질 수 있어(검증:
+`d=150,n=1.6` 참값 → `d=132,n=1.41` 복원) 기본값은 `False`.
 
-### 파이프라인 연결부 — `AsymmetricTDSAnalyzer.analyze_pair()`
+## 5. 직접 재현하는 검증 스크립트
 
-기존 naive transmittance 계산(`transmittance_mag`, `phase_difference`)은 그대로
-두고, `thin` 모드 + `fp_removal_method != "none"`일 때만 위 세 함수 중 하나로
-`transmittance`를 덮어쓴다. `thick` 모드는 이 블록에 아예 들어가지 않는다:
-
-```python
-fp_removal_info = None
-fp_method = fp_removal_method.strip().lower()
-if mode == "thin" and fp_method != "none":
-    thickness_um = thickness_cm * 1e4
-    if fp_method == "spectral_notch":
-        transmittance = remove_fp_ringing_spectral_notch(transmittance, thickness_um, film_n_guess)
-        fp_removal_info = {"method": fp_method, "thickness_um": thickness_um, "n_film_guess": film_n_guess}
-    elif fp_method == "known_film":
-        transmittance = correct_fp_ringing_known_film(
-            transmittance, film_n_guess, film_k_guess, thickness_um,
-            n_substrate=substrate_n, k_substrate=substrate_k,
-        )
-        fp_removal_info = {"method": fp_method, "thickness_um": thickness_um, "n_film": film_n_guess,
-                            "k_film": film_k_guess, "n_substrate": substrate_n, "k_substrate": substrate_k}
-    elif fp_method == "auto_calibrate":
-        transmittance, calibration = calibrate_fp_ringing(
-            transmittance, thickness_um, film_n_guess, film_k_guess,
-            n_substrate=substrate_n, k_substrate=substrate_k, fit_n_k=fit_film_n_k,
-        )
-        fp_removal_info = {"method": fp_method, **calibration}
-    else:
-        raise ValueError("fp_removal_method must be one of 'none', 'spectral_notch', 'known_film', 'auto_calibrate'.")
-    transmittance_mag = transmittance["mag"].to_numpy()
-    phase_difference = transmittance["phase"].to_numpy()
-
-alpha, k, n = compute_optical_constants(sample_crop.frequency, transmittance_mag, phase_difference, thickness_cm)
-```
-
-`thick` 모드에서는 `mode == "thin"`이 거짓이라 이 블록이 전혀 실행되지 않으므로
-기존 pellet 경로는 코드 레벨에서 그대로 보존된다. 모든 tier 함수 호출은 **키워드
-인자로만** 넘긴다 — 뒤에 substrate 파라미터를 끼워 넣으면서 위치 인자로 부르면
-엉뚱한 파라미터에 값이 바인딩되는 사고가 실제로 날 뻔했다 (`calibrate_fp_ringing`
-호출부에서 한 번 발견하고 고쳤다).
-
-## GUI 사용법 (FFT(multi).py)
-
-`thickness_mode`를 `thin (film)`으로 두고, **FP removal (thin only)** 콤보박스에서
-`none` / `spectral_notch` / `known_film` / `auto_calibrate` 중 선택한다.
-`film n (guess)` / `film k (guess)`에 필름의 대략적인 굴절률을, **`substrate n` /
-`substrate k`에 실제 substrate 재질의 굴절률**을 입력한다 (기본값은 Si 기준
-3.42/0.0 — SiO2면 ~1.95–2.1로 바꿔야 함). `spectral_notch`는 substrate 값을 쓰지
-않는다. `auto_calibrate` 아래 체크박스를 켜면 두께뿐 아니라 n,k도 같이 피팅한다
-(기본은 꺼짐, degeneracy 때문). `thick (pellet)` 모드에서 FP removal을 `none`이
-아닌 값으로 두면 Run Analysis가 에러를 낸다 — thin 모드 전용 기능이기 때문. 결과
-요약 텍스트에 어떤 방법과 파라미터가 쓰였는지(`FP removal: ...`) 표시된다.
-`fitting_gui.py`와 local-maxima 창은 수정하지 않았다 — 둘 다 `result.transmittance`를
-그대로 받아쓰는 구조라서, FP 보정이 적용되면 그 보정된 곡선을 그대로 넘겨받는다.
-
-## 검증
-
-자동화된 테스트 스위트가 프로젝트에 없어서, 아래 세 가지로 확인했다 (스크립트
-자체는 프로젝트 밖 scratchpad에 있어 커밋에는 포함되지 않음 — 재현하려면 같은
-구조의 스크립트를 직접 짜서 돌리면 됨. `functions.py`/`FFT(multi).py`만 커밋 대상).
-
-### 1. 합성 데이터 검증 (물리 로직이 맞는지, substrate 버그 수정 반영)
-
-필름이 Si 기판(n=3.42) 위에 있다고 가정하고, 알려진 FP factor를 주입한 합성
-transmittance(부드러운 배경 + 좁은 "공명" 하나 + FP ringing)에 세 방법을 적용해서
-(a) ringing이 실제로 줄어드는지 (b) 공명이 smear되지 않는지 확인한다. 최종 실행
-결과:
-
-```
-true (no-ringing) ln-mag residual RMS  : 0.01120
-measured (ringing) ln-mag residual RMS : 0.14048
-injected resonance depth (ground truth): 0.04618
-
-method                                            ringing RMS  ringing cut   res. depth  depth err
-Tier 1 spectral_notch                                 0.05612       60.1%      0.05495     19.0%
-Tier 2 known_film (WRONG: air substrate)              0.23032      -64.0%     -0.09606    308.0%
-Tier 2 known_film (correct substrate)                 0.01120       92.0%      0.04618      0.0%
-Tier 3 auto_calibrate (wrong initial d, correct sub)  0.01109       92.1%      0.04528      2.0%
-```
-
-Tier 2(정확한 substrate 포함 파라미터)는 ringing을 92% 줄이고 공명 depth 오차
-0% — 물리 공식 자체가 맞다는 증거. substrate를 공기로 잘못 가정하면(고치기 전
-버전) 오히려 ringing이 64% 늘고 depth가 308% 어긋난다 — 실제로 위험했다는 걸
-숫자로 확인. Tier 3은 두께를 33% 틀리게 준 초기값(100 µm, 참값 150 µm)에서도
-149.9 µm로 수렴해서 Tier 2와 거의 동일한 결과에 도달. Tier 1은 ringing을 60% 줄이지만
-공명 depth를 19% 깎아먹는다 — 버그가 아니라 "모델 없이 순수 주기성만으로 구분"하는
-방식의 근본적 트레이드오프. `fit_n_k=True`(두께+n+k 동시 피팅)는 참값
-`d=150,n=1.6`에서 `d=132,n=1.41`로 부정확하게 수렴 — degeneracy 때문에 기본값을
-`False`로 둔 이유. 1% 노이즈를 섞어도 세 방법 모두 합리적으로 동작.
-
-### 2. 회귀 확인 (기존 thick pellet 경로가 안 깨졌는지)
+아래 전체를 `verify_thin_film.py`로 저장하고 프로젝트 루트에서
+`"./.venv/Scripts/python.exe" verify_thin_film.py`로 실행하면 이 문서의 모든
+수치를 스스로 재현할 수 있다. (이 파일은 검증용이라 커밋 대상 아님 — 확인 후
+지워도 됨.)
 
 ```python
-result_thick = analyzer.analyze_pair(sample_df, reference_df, ..., thickness_mode='thick')
-assert result_thick.fp_removal_info is None
-assert result_thick.echo_guideline is not None   # 기존 로직 그대로 동작
+import sys
+from pathlib import Path
+import numpy as np
+import pandas as pd
 
-result_thin_none = analyzer.analyze_pair(sample_df, reference_df, ..., thickness_mode='thin', fp_removal_method='none')
-assert result_thin_none.fp_removal_info is None   # 새 코드 경로 자체가 실행 안 됨
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import functions as fn
+
+freq = np.linspace(0.5, 2.5, 5)
+
+# --- 성질 1: 계면이 없으면(n_substrate == n_film) ringing이 없어야 한다 ---
+fp_no_interface = fn.film_fp_factor(freq, 1.6, 0.02, 150.0, n_substrate=1.6, k_substrate=0.02)
+assert np.allclose(fp_no_interface, 1.0), "r12=0인데 ringing이 생기면 버그"
+print("[OK] substrate == film 이면 factor == 1")
+
+# --- 성질 2: n_substrate=1 이면 free-standing 특수식(1/(1-r01^2 e^{-2i delta}))과 일치해야 한다 ---
+n_film, k_film, d_um = 1.6, 0.02, 150.0
+n_tilde = n_film - 1j * k_film
+r01 = (1 - n_tilde) / (1 + n_tilde)
+delta = 2 * np.pi * freq * n_tilde * (d_um * 1e-4) / fn.SPEED_OF_LIGHT_CM_THZ
+expected_free_standing = 1.0 / (1.0 - r01**2 * np.exp(-2j * delta))
+actual = fn.film_fp_factor(freq, n_film, k_film, d_um, n_substrate=1.0, k_substrate=0.0)
+assert np.allclose(actual, expected_free_standing), "n_substrate=1 특수해와 안 맞으면 버그"
+print("[OK] n_substrate=1 -> free-standing 특수식과 일치")
+
+# --- 성질 3: 흡수가 커지면 |factor| -> 1로 수렴해야 한다 (§1.2) ---
+prev_spread = None
+for k in [0.0, 0.5, 1.0, 3.0]:
+    fp = fn.film_fp_factor(freq, n_film, k, d_um, n_substrate=3.42, k_substrate=0.0)
+    spread = float(np.max(np.abs(fp)) - np.min(np.abs(fp)))
+    assert np.max(np.abs(fp)) < 5, f"k_film={k}에서 발산하면 부호 버그"
+    if prev_spread is not None:
+        assert spread <= prev_spread + 1e-9, f"흡수가 늘었는데 ringing이 커지면 버그 (k={k})"
+    prev_spread = spread
+fp_high_k = np.abs(fn.film_fp_factor(freq, n_film, 3.0, d_um, n_substrate=3.42, k_substrate=0.0))
+assert np.allclose(fp_high_k, 1.0, atol=1e-3), "흡수 큰데 factor가 1로 안 가면 버그"
+print("[OK] k_film 증가 -> ringing 진폭 단조 감소, |factor| -> 1")
+
+
+def polynomial_residual_rms(freq, values, degree=3):
+    baseline = fn._polynomial_baseline(freq, values, degree)
+    return float(np.std(values - baseline))
+
+
+def main():
+    freq = np.linspace(0.2, 3.0, 2000)
+    f0, resonance_width, resonance_depth = 1.5, 0.03, 0.05
+    background_mag = 0.55 + 0.05 * np.sin(2 * np.pi * freq / 6.0)
+    true_mag = background_mag - resonance_depth * np.exp(-0.5 * ((freq - f0) / resonance_width) ** 2)
+    true_phase = 0.4 * freq + 0.03 * np.sin(2 * np.pi * freq / 4.0)
+    t_true = np.sqrt(true_mag) * np.exp(1j * true_phase)
+
+    n_film, k_film, d_film_um = 1.6, 0.02, 150.0
+    n_sub, k_sub = 3.42, 0.0
+    fp = fn.film_fp_factor(freq, n_film, k_film, d_film_um, n_sub, k_sub)
+    t_meas = t_true * fp
+    measured_mag = np.abs(t_meas) ** 2
+    measured_phase = np.unwrap(np.angle(t_meas))
+    transmittance = pd.DataFrame({"freq": freq, "mag": measured_mag, "phase": measured_phase})
+
+    true_rms = polynomial_residual_rms(freq, np.log(true_mag))
+    measured_rms = polynomial_residual_rms(freq, np.log(measured_mag))
+
+    def depth_at(mag):
+        baseline = fn._polynomial_baseline(freq, mag, 3)
+        window = np.abs(freq - f0) < resonance_width
+        return float(np.max(baseline[window] - mag[window]))
+
+    true_depth = depth_at(true_mag)
+
+    results = {
+        "Tier 1 spectral_notch": fn.remove_fp_ringing_spectral_notch(transmittance, d_film_um, n_film),
+        "Tier 2 known_film (WRONG: air substrate)": fn.correct_fp_ringing_known_film(transmittance, n_film, k_film, d_film_um),
+        "Tier 2 known_film (correct substrate)": fn.correct_fp_ringing_known_film(transmittance, n_film, k_film, d_film_um, n_sub, k_sub),
+    }
+    corrected3, info3 = fn.calibrate_fp_ringing(
+        transmittance, thickness_um=100.0, n_film_init=n_film, k_film_init=k_film,
+        n_substrate=n_sub, k_substrate=k_sub, fit_n_k=False,
+    )
+    results["Tier 3 auto_calibrate (wrong initial d)"] = corrected3
+
+    print(f"\ntrue ringing RMS={true_rms:.5f}  measured ringing RMS={measured_rms:.5f}  true depth={true_depth:.5f}")
+    print(f"Tier 3 recovered thickness: {info3['thickness_um']:.3f} um (true {d_film_um})")
+    print(f"\n{'method':40s}{'ringing RMS':>12s}{'ringing cut':>12s}{'depth':>10s}{'depth err':>12s}")
+    for name, corrected in results.items():
+        mag = corrected["mag"].to_numpy()
+        rms = polynomial_residual_rms(freq, np.log(np.clip(mag, 1e-12, None)))
+        depth = depth_at(mag)
+        print(f"{name:40s}{rms:12.5f}{1 - rms / measured_rms:11.1%}{depth:10.5f}{abs(depth - true_depth) / true_depth:11.1%}")
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-실제 실행 결과: `thick-mode regression: OK`, `thin/none regression: OK`. substrate
-파라미터를 포함한 세 가지 새 방법도 `analyze_pair()`를 통해 end-to-end로 호출해서
-예외 없이 finite한 값을 반환하고 `fp_removal_info`에 `n_substrate`/`k_substrate`가
-정확히 기록되는지 확인했다. 잘못된 `fp_removal_method` 문자열을 주면 `ValueError`로
-명확히 실패하는 것도 확인했다.
+기대 출력(참고용 — 정확히 같은 소수점까지 나올 필요는 없고, **부호/방향**이
+같으면 됨): Tier 2(correct substrate)는 ringing cut 약 88%, depth err 0%에 가까워야
+하고, Tier 2(WRONG: air substrate)는 ringing cut이 **음수**(즉 ringing이 더
+심해짐)로 나와야 한다 — 이게 §1.1에서 고친 버그가 진짜 위험했다는 재현.
 
-### 3. 정적/구성 검증
+## 6. GUI 사용법 (참고, `functions.py`와 무관한 부분)
 
-```
-"./.venv/Scripts/python.exe" -m py_compile "FFT(multi).py" functions.py fitting_gui.py "history/FFT(thick).py"
-```
+`thickness_mode`를 `thin (film)`으로, **FP removal (thin only)** 콤보박스에서
+`none`/`spectral_notch`/`known_film`/`auto_calibrate` 선택. `film n/k (guess)`에
+필름 굴절률, **`substrate n/k`에 실제 substrate 재질의 굴절률**(기본값 Si
+3.42/0.0, SiO2면 ~1.95–2.1로 변경) 입력. `auto_calibrate` 체크박스는 두께 외
+n,k도 같이 피팅할지 여부(기본 꺼짐). `thick` 모드에서 FP removal을 켜면 에러.
 
-전부 컴파일 통과. `history/FFT(thick).py`도 `functions.py`를 import하지만
-`analyze_pair()`를 전부 keyword 인자로 호출하므로 이번에 뒤쪽에 default 인자로만
-추가된 파라미터들과 충돌하지 않는다 (직접 확인함). `FFT(multi).py`는 headless로
-`FFTPlatformGUI()`를 생성/파괴해서 새 콤보박스·substrate 입력칸·StringVar 초기화가
-예외 없이 동작하는 것까지 확인했다. **실제 tkinter 창을 띄워 클릭해보는 대화형
-테스트, 그리고 실제 substrate+Au(+film) 데이터로 ringing이 눈으로 줄어드는지는
-아직 확인 못 했다** — 다음 단계로 남아 있음.
+## 7. 아직 확인 못 한 것 / 다음 단계
 
-## 다음에 고려할 만한 것 (이번 범위 밖)
-
-- `fitting_gui.py`에서 raw vs FP-corrected 곡선을 겹쳐서 비교하는 기능.
-- substrate 광학상수를 별도 측정에서 자동으로 불러오는 기능 (지금은 수동 입력).
-- Tier 1의 notch 폭을 GUI에서 조절 가능하게 노출.
+- **실제 substrate+Au(+film) 데이터로 GUI를 열어서 눈으로 ringing이 줄어드는지
+  확인 안 했다.** 지금까지는 전부 합성 데이터 + 코드 직접 호출 검증뿐이다.
+- §1.2의 부호 수정은 아직 커밋 안 됨 (`git diff -- functions.py`로 확인 가능).
+- `fitting_gui.py`에서 raw vs FP-corrected 비교 기능, substrate 광학상수 자동
+  로드, Tier 1 notch 폭 GUI 노출 — 전부 이번 범위 밖.

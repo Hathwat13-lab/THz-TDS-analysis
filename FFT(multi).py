@@ -10,7 +10,14 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from functions import AsymmetricTDSAnalyzer, find_transmittance_local_maxima, find_transmittance_maximum
+from functions import (
+    AsymmetricTDSAnalyzer,
+    TransmittanceLocalMaximum,
+    find_transmittance_local_maxima,
+    find_transmittance_local_minima,
+    find_transmittance_maximum,
+    find_transmittance_minimum,
+)
 
 
 DEFAULT_REFERENCE = ""
@@ -20,15 +27,16 @@ TMAX_FREQUENCY_MAX_THZ = 2.5
 
 
 class LocalMaximaWindow(tk.Toplevel):
-    """Display local transmittance maxima for one or more analyzed samples."""
+    """Display local transmittance maxima or minima for one or more analyzed samples."""
 
     def __init__(self, parent: tk.Misc, spectra: list[tuple[Path, pd.DataFrame]]) -> None:
         super().__init__(parent)
-        self.title("Transmittance local maxima")
         self.geometry("1450x900")
         self.minsize(1000, 650)
         self.spectra = spectra
-        self.maxima_by_sample = [find_transmittance_local_maxima(frame) for _, frame in spectra]
+        self.minima_mode = tk.BooleanVar(value=False)
+        self.extrema_by_sample: list[list[TransmittanceLocalMaximum]] = []
+        self.trees: list[ttk.Treeview] = []
 
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
@@ -44,20 +52,23 @@ class LocalMaximaWindow(tk.Toplevel):
         plot_frame.columnconfigure(0, weight=1)
         table_frame = ttk.Frame(root)
         table_frame.grid(row=0, column=1, sticky="nsew")
-        table_frame.rowconfigure(1, weight=1)
+        table_frame.rowconfigure(2, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(
-            table_frame, text="Local-maximum coordinates", font=("Segoe UI", 11, "bold")
-        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.header_label = ttk.Label(table_frame, text="", font=("Segoe UI", 11, "bold"))
+        self.header_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Checkbutton(
+            table_frame, text="Minima mode", variable=self.minima_mode, command=self._on_mode_toggled
+        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
         self.tables = ttk.Notebook(table_frame)
-        self.tables.grid(row=1, column=0, sticky="nsew")
+        self.tables.grid(row=2, column=0, sticky="nsew")
+        self.export_button = ttk.Button(table_frame, text="", command=self._export_extrema)
+        self.export_button.grid(row=3, column=0, sticky="e", pady=(6, 0))
 
         self.figure = Figure(figsize=(9, 7), dpi=100, constrained_layout=True)
         self.axis = self.figure.add_subplot(111)
 
-        for index, (sample_path, transmittance) in enumerate(spectra):
-            maxima = self.maxima_by_sample[index]
+        for index, (sample_path, _transmittance) in enumerate(spectra):
             tab = ttk.Frame(self.tables, padding=6)
             # A notebook computes its requested width from every tab label.
             # Keep labels short and show the complete source name inside its
@@ -79,10 +90,7 @@ class LocalMaximaWindow(tk.Toplevel):
             table.configure(yscrollcommand=scrollbar.set)
             table.grid(row=1, column=0, sticky="nsew")
             scrollbar.grid(row=1, column=1, sticky="ns")
-            for number, point in enumerate(maxima, start=1):
-                table.insert("", "end", values=(number, f"{point.frequency_thz:.8g}", f"{point.transmittance:.8g}"))
-            if not maxima:
-                table.insert("", "end", values=("-", "No local maxima", ""))
+            self.trees.append(table)
 
         # Keep Python references for the lifetime of the Toplevel.  Without
         # them Tk can retain an empty widget after Matplotlib's canvas object
@@ -90,9 +98,39 @@ class LocalMaximaWindow(tk.Toplevel):
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.tables.bind("<<NotebookTabChanged>>", self._on_table_changed)
-        self._draw_selected_spectrum(0)
+        self._recompute_extrema()
         self.update_idletasks()
         self.canvas.draw()
+
+    def _extremum_label(self) -> str:
+        return "minima" if self.minima_mode.get() else "maxima"
+
+    def _current_tab_index(self) -> int:
+        selection = self.tables.select()
+        return self.tables.index(selection) if selection else 0
+
+    def _on_mode_toggled(self) -> None:
+        self._recompute_extrema()
+
+    def _recompute_extrema(self) -> None:
+        finder = find_transmittance_local_minima if self.minima_mode.get() else find_transmittance_local_maxima
+        self.extrema_by_sample = [finder(frame) for _, frame in self.spectra]
+        label = self._extremum_label()
+        singular = "minimum" if self.minima_mode.get() else "maximum"
+
+        self.title(f"Transmittance local {label}")
+        self.header_label.configure(text=f"Local-{singular} coordinates")
+        self.export_button.configure(text=f"Export local {label}...")
+
+        for tree, extrema in zip(self.trees, self.extrema_by_sample):
+            tree.delete(*tree.get_children())
+            for number, point in enumerate(extrema, start=1):
+                tree.insert("", "end", values=(number, f"{point.frequency_thz:.8g}", f"{point.transmittance:.8g}"))
+            if not extrema:
+                tree.insert("", "end", values=("-", f"No local {label}", ""))
+
+        self._draw_selected_spectrum(self._current_tab_index())
+        self.canvas.draw_idle()
 
     def _on_table_changed(self, _event=None) -> None:
         selected_index = self.tables.index(self.tables.select())
@@ -102,40 +140,118 @@ class LocalMaximaWindow(tk.Toplevel):
     def _draw_selected_spectrum(self, index: int) -> None:
         """Draw only the sample selected in the coordinate-table tabs."""
         sample_path, transmittance = self.spectra[index]
-        maxima = self.maxima_by_sample[index]
+        extrema = self.extrema_by_sample[index]
+        label = self._extremum_label()
         frequency = transmittance["freq"].to_numpy(dtype=float)
         values = transmittance["mag"].to_numpy(dtype=float)
         valid = np.isfinite(frequency) & np.isfinite(values)
 
         self.axis.clear()
         self.axis.plot(frequency[valid], values[valid], color="tab:blue", linewidth=1.45, label=sample_path.stem)
-        if maxima:
+        if extrema:
             self.axis.scatter(
-                [point.frequency_thz for point in maxima],
-                [point.transmittance for point in maxima],
-                marker="x", color="crimson", s=62, linewidths=1.9, zorder=5, label="Local maxima",
+                [point.frequency_thz for point in extrema],
+                [point.transmittance for point in extrema],
+                marker="x", color="crimson", s=62, linewidths=1.9, zorder=5, label=f"Local {label}",
             )
-        self.axis.set_title(f"Local maxima — #{index + 1}: {sample_path.name}")
+        self.axis.set_title(f"Local {label} — #{index + 1}: {sample_path.name}")
         self.axis.set_xlabel("Frequency [THz]")
         self.axis.set_ylabel("Transmittance")
         self.axis.grid(True, alpha=0.3)
         self.axis.legend(loc="best", fontsize=8)
 
+    def _export_extrema(self) -> None:
+        label = self._extremum_label()
+        if not any(self.extrema_by_sample):
+            messagebox.showinfo(f"Export local {label}", f"No local {label} were found for the loaded samples.")
+            return
 
-def export_tmax_metrics_to_excel(metrics: list[tuple[Path, float, float]], output_path: str | Path) -> pd.DataFrame:
-    """Save the already-sorted Tmax metrics as a formatted Excel worksheet."""
+        output_path = filedialog.asksaveasfilename(
+            title=f"Export local {label}",
+            defaultextension=".xlsx",
+            initialfile=f"local_{label}.xlsx",
+            filetypes=[
+                ("Excel workbook", "*.xlsx"),
+                ("CSV file", "*.csv"),
+                ("Text file", "*.txt"),
+            ],
+        )
+        if not output_path:
+            return
+        try:
+            table = export_local_maxima_table(self.spectra, self.extrema_by_sample, output_path, kind=label)
+        except Exception as exc:
+            messagebox.showerror(f"Export local {label}", str(exc))
+            return
+
+        messagebox.showinfo(f"Export local {label}", f"Saved {len(table)} row(s) to:\n{output_path}")
+
+
+def export_local_maxima_table(
+    spectra: list[tuple[Path, pd.DataFrame]],
+    maxima_by_sample: list[list[TransmittanceLocalMaximum]],
+    output_path: str | Path,
+    kind: str = "maxima",
+) -> pd.DataFrame:
+    """Save every sample's local transmittance maxima or minima as one combined table.
+
+    The output format is chosen from output_path's extension: .xlsx gets the
+    same formatted-worksheet treatment as the Tmax export, .txt is
+    tab-separated, and anything else (typically .csv) is comma-separated.
+    """
+
+    rows = [
+        {
+            "sample": sample_path.name,
+            "no.": number,
+            "frequency [THz]": point.frequency_thz,
+            "transmittance": point.transmittance,
+        }
+        for (sample_path, _), maxima in zip(spectra, maxima_by_sample)
+        for number, point in enumerate(maxima, start=1)
+    ]
+    table = pd.DataFrame(rows, columns=["sample", "no.", "frequency [THz]", "transmittance"])
+
+    output_path = Path(output_path)
+    suffix = output_path.suffix.lower()
+    sheet_name = f"Local {kind}"
+    if suffix == ".xlsx":
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            table.to_excel(writer, sheet_name=sheet_name, index=False)
+            worksheet = writer.sheets[sheet_name]
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for cell in worksheet[1]:
+                cell.font = cell.font.copy(bold=True)
+            for column, width in {"A": 48, "B": 8, "C": 18, "D": 18}.items():
+                worksheet.column_dimensions[column].width = width
+            for row in worksheet.iter_rows(min_row=2, min_col=3, max_col=4):
+                for cell in row:
+                    cell.number_format = "0.000000"
+    elif suffix == ".txt":
+        table.to_csv(output_path, sep="\t", index=False)
+    else:
+        table.to_csv(output_path, index=False)
+    return table
+
+
+def export_tmax_metrics_to_excel(
+    metrics: list[tuple[Path, float, float]], output_path: str | Path, label: str = "Tmax"
+) -> pd.DataFrame:
+    """Save the already-sorted Tmax/Tmin metrics as a formatted Excel worksheet."""
 
     table = pd.DataFrame(
         {
             "no.": range(1, len(metrics) + 1),
             "name": [sample_path.name for sample_path, _, _ in metrics],
-            "f@Tmax [THz]": [frequency for _, frequency, _ in metrics],
-            "Tmax": [value for _, _, value in metrics],
+            f"f@{label} [THz]": [frequency for _, frequency, _ in metrics],
+            label: [value for _, _, value in metrics],
         }
     )
+    sheet_name = f"{label} trend"
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        table.to_excel(writer, sheet_name="Tmax trend", index=False)
-        worksheet = writer.sheets["Tmax trend"]
+        table.to_excel(writer, sheet_name=sheet_name, index=False)
+        worksheet = writer.sheets[sheet_name]
         worksheet.freeze_panes = "A2"
         worksheet.auto_filter.ref = worksheet.dimensions
         for cell in worksheet[1]:
@@ -183,6 +299,7 @@ class FFTPlatformGUI(tk.Tk):
         self.substrate_k_guess = tk.StringVar(value="0.0")
         self.fit_film_n_k = tk.BooleanVar(value=False)
         self.echo_guideline_enabled = tk.BooleanVar(value=False)
+        self.tmax_minima_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self.active_sample_name = tk.StringVar(value="(none)")
 
@@ -343,7 +460,7 @@ class FFTPlatformGUI(tk.Tk):
         )
         row += 1
 
-        ttk.Button(self.control_frame, text="Show local maxima", command=self._open_local_maxima_window).grid(
+        ttk.Button(self.control_frame, text="Show local extrema", command=self._open_local_maxima_window).grid(
             row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6)
         )
         row += 1
@@ -508,10 +625,15 @@ class FFTPlatformGUI(tk.Tk):
         self.optical_canvas = FigureCanvasTkAgg(self.optical_figure, master=self.optical_tab)
         self.optical_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
+        self.tmax_sort_label = tk.StringVar(value="Sorted by f@Tmax (ascending)")
         tmax_toolbar = ttk.Frame(self.tmax_tab, padding=(0, 0, 0, 6))
         tmax_toolbar.grid(row=0, column=0, sticky="ew")
-        ttk.Label(tmax_toolbar, text="Sorted by f@Tmax (ascending)").pack(side="left")
-        ttk.Button(tmax_toolbar, text="Export Tmax to Excel", command=self._export_tmax_to_excel).pack(side="right")
+        ttk.Label(tmax_toolbar, textvariable=self.tmax_sort_label).pack(side="left")
+        ttk.Checkbutton(
+            tmax_toolbar, text="Minima mode (Tmin)", variable=self.tmax_minima_mode, command=self._on_tmax_mode_toggled
+        ).pack(side="left", padx=(12, 0))
+        self.tmax_export_button = ttk.Button(tmax_toolbar, text="Export Tmax to Excel", command=self._export_tmax_to_excel)
+        self.tmax_export_button.pack(side="right")
 
         self.tmax_canvas = FigureCanvasTkAgg(self.tmax_figure, master=self.tmax_tab)
         self.tmax_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
@@ -679,16 +801,20 @@ class FFTPlatformGUI(tk.Tk):
         self.ax_phase.set_xlabel("Frequency [THz]")
         self.ax_phase.set_ylabel("Phase [rad]")
 
+    def _tmax_label(self) -> str:
+        return "Tmin" if self.tmax_minima_mode.get() else "Tmax"
+
     def _style_tmax_axes(self) -> None:
+        label = self._tmax_label()
         for ax in [self.ax_tmax_frequency, self.ax_tmax_value]:
             ax.clear()
             ax.grid(True, axis="y", alpha=0.3)
 
         self.ax_tmax_frequency.set_title(
-            f"Frequency at Tmax ({TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz)")
+            f"Frequency at {label} ({TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz)")
         self.ax_tmax_frequency.set_ylabel("Frequency [THz]")
         self.ax_tmax_value.set_title(
-            f"Tmax ({TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz)")
+            f"{label} ({TMAX_FREQUENCY_MIN_THZ:g}-{TMAX_FREQUENCY_MAX_THZ:g} THz)")
         self.ax_tmax_value.set_xlabel("Sample")
         self.ax_tmax_value.set_ylabel("Transmittance")
 
@@ -879,19 +1005,27 @@ class FFTPlatformGUI(tk.Tk):
         self.optical_canvas.draw_idle()
         self.tmax_canvas.draw_idle()
 
-    def _update_tmax_metrics(self) -> list[str]:
-        """Extract one in-band transmittance maximum per analyzed sample."""
+    def _on_tmax_mode_toggled(self) -> None:
+        label = self._tmax_label()
+        self.tmax_sort_label.set(f"Sorted by f@{label} (ascending)")
+        self.tmax_export_button.configure(text=f"Export {label} to Excel")
+        self._update_tmax_metrics()
+        self._render_active_result()
 
+    def _update_tmax_metrics(self) -> list[str]:
+        """Extract one in-band transmittance maximum or minimum per analyzed sample."""
+
+        finder = find_transmittance_minimum if self.tmax_minima_mode.get() else find_transmittance_maximum
         self.tmax_metrics = []
         unavailable = []
         for sample_path, result in self.results:
             try:
-                maximum = find_transmittance_maximum(
+                extremum = finder(
                     result.transmittance,
                     frequency_min_thz=TMAX_FREQUENCY_MIN_THZ,
                     frequency_max_thz=TMAX_FREQUENCY_MAX_THZ,
                 )
-                self.tmax_metrics.append((sample_path, maximum.frequency_thz, maximum.transmittance))
+                self.tmax_metrics.append((sample_path, extremum.frequency_thz, extremum.transmittance))
             except ValueError as exc:
                 unavailable.append(f"{sample_path.name}: {exc}")
         self.tmax_metrics.sort(key=lambda metric: metric[1])
@@ -941,27 +1075,28 @@ class FFTPlatformGUI(tk.Tk):
             )
 
     def _export_tmax_to_excel(self) -> None:
+        label = self._tmax_label()
         if not self.tmax_metrics:
-            messagebox.showinfo("Export Tmax", "Run the analysis first so Tmax metrics are available.")
+            messagebox.showinfo(f"Export {label}", f"Run the analysis first so {label} metrics are available.")
             return
 
         output_path = filedialog.asksaveasfilename(
-            title="Export Tmax trend to Excel",
+            title=f"Export {label} trend to Excel",
             defaultextension=".xlsx",
-            initialfile="tmax_trend.xlsx",
+            initialfile=f"{label.lower()}_trend.xlsx",
             filetypes=[("Excel workbook", "*.xlsx")],
         )
         if not output_path:
             return
         try:
-            table = export_tmax_metrics_to_excel(self.tmax_metrics, output_path)
+            table = export_tmax_metrics_to_excel(self.tmax_metrics, output_path, label=label)
         except Exception as exc:
             self.status.set(f"Excel export failed: {exc}")
-            messagebox.showerror("Export Tmax", str(exc))
+            messagebox.showerror(f"Export {label}", str(exc))
             return
 
-        self.status.set(f"Exported {len(table)} Tmax row(s) to {Path(output_path).name}")
-        messagebox.showinfo("Export Tmax", f"Saved {len(table)} row(s) to:\n{output_path}")
+        self.status.set(f"Exported {len(table)} {label} row(s) to {Path(output_path).name}")
+        messagebox.showinfo(f"Export {label}", f"Saved {len(table)} row(s) to:\n{output_path}")
 
     def _set_summary(self, text: str) -> None:
         self.summary.configure(state="normal")
