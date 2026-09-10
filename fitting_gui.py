@@ -68,12 +68,12 @@ MODEL_DESCRIPTIONS = {
     "Lorentzian": (
         "T(f) = b + A*Gamma^2 / ((f - f0)^2 + Gamma^2)\n"
         "b: baseline, A: peak height, f0: resonance frequency, Gamma: HWHM\n"
-        "FWHM = 2*Gamma; Q = (f @ Tmax) / FWHM"
+        "FWHM = 2*Gamma; Q = (f @ selected extremum) / FWHM"
     ),
     "Gaussian": (
         "T(f) = b + A*exp(-(f - f0)^2 / (2*sigma^2))\n"
         "b: baseline, A: peak height, f0: center, sigma: standard deviation\n"
-        "FWHM = 2*sqrt(2*ln(2))*sigma; Q = (f @ Tmax) / FWHM"
+        "FWHM = 2*sqrt(2*ln(2))*sigma; Q = (f @ selected extremum) / FWHM"
     ),
     "Fano (planned)": "Fano asymmetric resonance model — planned for a future update.",
     "Drude-Smith (planned)": "Drude-Smith carrier-response model — planned for a future update.",
@@ -88,6 +88,8 @@ class SingleFitResult:
     fitted_transmittance: np.ndarray
     tmax: float
     frequency_at_tmax_thz: float
+    tmin: float
+    frequency_at_tmin_thz: float
     fwhm_thz: float
     q_factor: float
     r_squared: float
@@ -114,6 +116,8 @@ class CumulativeFitResult:
     peaks: tuple[CumulativePeakResult, ...]
     tmax: float
     frequency_at_tmax_thz: float
+    tmin: float
+    frequency_at_tmin_thz: float
     r_squared: float
     adjusted_r_squared: float
 
@@ -160,27 +164,31 @@ def fit_single_transmittance(
     model_name: str,
     frequency_min_thz: float,
     frequency_max_thz: float,
+    extremum: str = "maximum",
 ) -> SingleFitResult:
-    """Fit one positive resonance in the selected transmittance band.
+    """Fit one peak (maximum) or dip (minimum) in the selected transmittance band.
 
     The input DataFrame must have the same ``freq`` and ``mag`` columns used
     by ``AnalysisResult.transmittance`` in the main FFT application.
     """
 
+    if extremum not in ("maximum", "minimum"):
+        raise ValueError("extremum must be maximum or minimum.")
+    sign = 1.0 if extremum == "maximum" else -1.0
     if model_name not in FIT_MODELS:
         raise ValueError(f"{model_name} is not available for fitting yet.")
     frequency, values = _select_fit_data(transmittance, frequency_min_thz, frequency_max_thz)
 
     model = FIT_MODELS[model_name]
-    peak_index = int(np.argmax(values))
-    baseline_guess = float(np.percentile(values, 10))
-    amplitude_guess = max(float(values[peak_index] - baseline_guess), max(abs(float(values[peak_index])) * 1e-3, 1e-6))
+    peak_index = int(np.argmax(sign * values))
+    baseline_guess = float(np.percentile(values, 10 if sign > 0 else 90))
+    amplitude_guess = sign * max(sign * float(values[peak_index] - baseline_guess), max(abs(float(values[peak_index])) * 1e-3, 1e-6))
     center_guess = float(frequency[peak_index])
     minimum_width = max(float(np.median(np.diff(np.sort(frequency)))), 1e-6)
     width_guess = max((frequency_max_thz - frequency_min_thz) / 10.0, minimum_width * 2.0)
 
-    lower_bounds = (-np.inf, 0.0, frequency_min_thz, minimum_width / 2.0)
-    upper_bounds = (np.inf, np.inf, frequency_max_thz, frequency_max_thz - frequency_min_thz)
+    lower_bounds = (-np.inf, 0.0 if sign > 0 else -np.inf, frequency_min_thz, minimum_width / 2.0)
+    upper_bounds = (np.inf, np.inf if sign > 0 else 0.0, frequency_max_thz, frequency_max_thz - frequency_min_thz)
     parameters, _ = curve_fit(
         model.function,
         frequency,
@@ -196,6 +204,7 @@ def fit_single_transmittance(
     dense_frequency = np.linspace(frequency_min_thz, frequency_max_thz, 4_001)
     fitted_values = model.function(dense_frequency, *parameters)
     max_index = int(np.argmax(fitted_values))
+    min_index = int(np.argmin(fitted_values))
     fwhm = float(model.width_to_fwhm * parameters[3])
     frequency_at_tmax = float(dense_frequency[max_index])
     return SingleFitResult(
@@ -205,8 +214,10 @@ def fit_single_transmittance(
         fitted_transmittance=fitted_values,
         tmax=float(fitted_values[max_index]),
         frequency_at_tmax_thz=frequency_at_tmax,
+        tmin=float(fitted_values[min_index]),
+        frequency_at_tmin_thz=float(dense_frequency[min_index]),
         fwhm_thz=fwhm,
-        q_factor=frequency_at_tmax / fwhm if fwhm > 0 else float("nan"),
+        q_factor=float(dense_frequency[max_index if sign > 0 else min_index]) / fwhm if fwhm > 0 else float("nan"),
         r_squared=r_squared,
         adjusted_r_squared=adjusted_r_squared,
     )
@@ -218,9 +229,13 @@ def fit_cumulative_resonances(
     clicked_peaks: list[tuple[float, float]],
     frequency_min_thz: float,
     frequency_max_thz: float,
+    extremum: str = "maximum",
 ) -> CumulativeFitResult:
     """Simultaneously fit selected symmetric resonance components from click seeds."""
 
+    if extremum not in ("maximum", "minimum"):
+        raise ValueError("extremum must be maximum or minimum.")
+    sign = 1.0 if extremum == "maximum" else -1.0
     if model_name not in FIT_MODELS:
         raise ValueError(f"{model_name} is not available for cumulative fitting yet.")
     if not clicked_peaks:
@@ -236,7 +251,7 @@ def fit_cumulative_resonances(
             f"{peak_count} clicked peaks need more than {parameter_count + 1} finite data points in the fit band."
         )
 
-    baseline_guess = float(np.percentile(values, 10))
+    baseline_guess = float(np.percentile(values, 10 if sign > 0 else 90))
     minimum_width = max(float(np.median(np.diff(np.sort(frequency)))), 1e-6)
     width_guess = max((frequency_max_thz - frequency_min_thz) / max(8.0, 4.0 * peak_count), minimum_width * 2.0)
     initial_parameters: list[float] = [baseline_guess]
@@ -244,10 +259,10 @@ def fit_cumulative_resonances(
     upper_bounds: list[float] = [np.inf]
     amplitude_floor = max(abs(float(np.max(values))) * 1e-3, 1e-6)
     for clicked_frequency, clicked_value in clicked_peaks:
-        amplitude_guess = max(clicked_value - baseline_guess, amplitude_floor)
+        amplitude_guess = sign * max(sign * (clicked_value - baseline_guess), amplitude_floor)
         initial_parameters.extend([amplitude_guess, clicked_frequency, width_guess])
-        lower_bounds.extend([0.0, frequency_min_thz, minimum_width / 2.0])
-        upper_bounds.extend([np.inf, frequency_max_thz, frequency_max_thz - frequency_min_thz])
+        lower_bounds.extend([0.0 if sign > 0 else -np.inf, frequency_min_thz, minimum_width / 2.0])
+        upper_bounds.extend([np.inf if sign > 0 else 0.0, frequency_max_thz, frequency_max_thz - frequency_min_thz])
 
     def cumulative_function(frequency_values: np.ndarray, offset: float, *peak_parameters: float) -> np.ndarray:
         fitted = np.full_like(frequency_values, offset, dtype=float)
@@ -285,6 +300,7 @@ def fit_cumulative_resonances(
         for index, (amplitude, center, width) in enumerate(component_parameters, start=1)
     )
     max_index = int(np.argmax(fitted_values))
+    min_index = int(np.argmin(fitted_values))
     return CumulativeFitResult(
         model_name=model.name,
         frequency_thz=dense_frequency,
@@ -294,6 +310,8 @@ def fit_cumulative_resonances(
         peaks=peaks,
         tmax=float(fitted_values[max_index]),
         frequency_at_tmax_thz=float(dense_frequency[max_index]),
+        tmin=float(fitted_values[min_index]),
+        frequency_at_tmin_thz=float(dense_frequency[min_index]),
         r_squared=r_squared,
         adjusted_r_squared=adjusted_r_squared,
     )
@@ -311,12 +329,15 @@ class TransmittanceFittingWindow(tk.Toplevel):
         self.source_name = source_name
         self.fit_min = tk.StringVar(value=f"{DEFAULT_FIT_MIN_THZ:g}")
         self.fit_max = tk.StringVar(value=f"{DEFAULT_FIT_MAX_THZ:g}")
+        self.extremum = tk.StringVar(value="maximum")
         self.fit_mode = tk.StringVar(value="single")
         self.status = tk.StringVar(value="Select a resonance model, then run a single fit.")
         self.model_formula = tk.StringVar()
         self.clicked_peak_summary = tk.StringVar(value="No peaks selected.")
         self.clicked_peaks: list[tuple[float, float]] = []
         self.result_values = {
+            "Tmin": tk.StringVar(value="\u2014"),
+            "f @ Tmin": tk.StringVar(value="\u2014"),
             "Tmax": tk.StringVar(value="—"),
             "f @ Tmax": tk.StringVar(value="—"),
             "FWHM": tk.StringVar(value="—"),
@@ -356,6 +377,12 @@ class TransmittanceFittingWindow(tk.Toplevel):
         ttk.Radiobutton(mode_frame, text="Cumulative", value="cumulative", variable=self.fit_mode, command=self._on_mode_changed).pack(
             side="left", padx=(8, 0)
         )
+
+        direction_frame = ttk.Frame(mode_frame)
+        direction_frame.pack(side="bottom", anchor="w")
+        for label, value in (("Maximum", "maximum"), ("Minimum", "minimum")):
+            ttk.Radiobutton(direction_frame, text=label, value=value, variable=self.extremum,
+                            command=self._on_extremum_changed).pack(side="left")
 
         ttk.Label(controls, text="Fit band [THz]", font=("Segoe UI", 10, "bold")).grid(
             row=3, column=0, columnspan=2, sticky="w", pady=(14, 3)
@@ -470,6 +497,11 @@ class TransmittanceFittingWindow(tk.Toplevel):
         model_name = self._selected_model_name()
         self.model_formula.set(MODEL_DESCRIPTIONS.get(model_name, "Select a model to see its fitting equation."))
 
+    def _on_extremum_changed(self) -> None:
+        self.clicked_peaks.clear()
+        self._on_mode_changed()
+        self.status.set(f"{self.extremum.get().title()} selected. Click dips for cumulative minimum fitting.")
+
     def _on_mode_changed(self) -> None:
         if self.fit_mode.get() == "cumulative":
             self.status.set("Cumulative mode: select Lorentzian or Gaussian, then click peaks on the graph.")
@@ -487,7 +519,7 @@ class TransmittanceFittingWindow(tk.Toplevel):
         self.clear_peaks_button.configure(state="normal" if cumulative and self.clicked_peaks else "disabled")
         if cumulative:
             self.clicked_peak_summary.set(
-                f"{len(self.clicked_peaks)} peak(s) selected. Left-click a peak inside the fit band."
+                f"{len(self.clicked_peaks)} peak(s) selected. Left-click a peak/dip inside the fit band."
             )
         else:
             self.clicked_peak_summary.set("Switch to Cumulative mode to select peaks on the graph.")
@@ -623,6 +655,9 @@ class TransmittanceFittingWindow(tk.Toplevel):
             self.ax.scatter(
                 [result.frequency_at_tmax_thz], [result.tmax], color="tab:red", zorder=6, label="Tmax (fit)"
             )
+        if result is not None:
+            self.ax.scatter([result.frequency_at_tmin_thz], [result.tmin],
+                            color="tab:blue", marker="v", zorder=6, label="Tmin (fit)")
         self.ax.set_title(f"Transmittance fitting: {self.source_name}")
         self.ax.set_xlabel("Frequency [THz]")
         self.ax.set_ylabel("Transmittance")
@@ -639,7 +674,7 @@ class TransmittanceFittingWindow(tk.Toplevel):
                 if model_name not in FIT_MODELS:
                     messagebox.showinfo("Model unavailable", f"{model_name} is planned but is not implemented yet.")
                     return
-                result = fit_single_transmittance(self.transmittance, model_name, *band)
+                result = fit_single_transmittance(self.transmittance, model_name, *band, extremum=self.extremum.get())
                 self._show_single_result(result)
                 self.status.set(f"{result.model_name} single fit complete.")
             else:
@@ -647,7 +682,7 @@ class TransmittanceFittingWindow(tk.Toplevel):
                 if model_name not in FIT_MODELS:
                     messagebox.showinfo("Model unavailable", f"{model_name} is planned but is not implemented yet.")
                     return
-                result = fit_cumulative_resonances(self.transmittance, model_name, self.clicked_peaks, *band)
+                result = fit_cumulative_resonances(self.transmittance, model_name, self.clicked_peaks, *band, extremum=self.extremum.get())
                 self._show_cumulative_result(result)
                 self.status.set(f"Cumulative {result.model_name} fit complete: {len(result.peaks)} peak(s).")
         except Exception as exc:
@@ -658,6 +693,8 @@ class TransmittanceFittingWindow(tk.Toplevel):
 
     def _show_single_result(self, result: SingleFitResult) -> None:
         self._reset_fit_results()
+        self.result_values["Tmin"].set(f"{result.tmin:.6g}")
+        self.result_values["f @ Tmin"].set(f"{result.frequency_at_tmin_thz:.6g} THz")
         self.result_values["Tmax"].set(f"{result.tmax:.6g}")
         self.result_values["f @ Tmax"].set(f"{result.frequency_at_tmax_thz:.6g} THz")
         self.result_values["FWHM"].set(f"{result.fwhm_thz:.6g} THz")
@@ -666,6 +703,8 @@ class TransmittanceFittingWindow(tk.Toplevel):
 
     def _show_cumulative_result(self, result: CumulativeFitResult) -> None:
         self._reset_fit_results()
+        self.result_values["Tmin"].set(f"{result.tmin:.6g}")
+        self.result_values["f @ Tmin"].set(f"{result.frequency_at_tmin_thz:.6g} THz")
         self.result_values["Tmax"].set(f"{result.tmax:.6g}")
         self.result_values["f @ Tmax"].set(f"{result.frequency_at_tmax_thz:.6g} THz")
         self.result_values["FWHM"].set("See peak table")

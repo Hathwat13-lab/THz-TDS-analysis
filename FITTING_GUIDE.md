@@ -6,9 +6,8 @@
 창은 활성 샘플에서 이미 계산된 `transmittance` 데이터(`freq`, `mag`)만 별도 fitting
 창으로 전달합니다. 따라서 time-domain 처리나 FFT를 다시 수행하지 않습니다.
 
-현재 구현은 일정한 background 위에 놓인 **하나의 양의 대칭 공명**을 대상으로 합니다.
-Lorentzian과 Gaussian 모델을 제공하며, Fano, Drude-Smith, multi-peak/cumulative
-fitting은 아직 구현하지 않았습니다.
+The fitter supports Lorentzian and Gaussian peaks and dips in Single and Cumulative modes.
+Fano and Drude-Smith remain planned.
 
 ## 사용 순서
 
@@ -33,7 +32,7 @@ $$
 | Parameter | Meaning |
 | --- | --- |
 | $b$ | Frequency-independent transmittance background. |
-| $A$ | Peak height above the background. It is constrained to be non-negative. |
+| $A$ | Signed amplitude: non-negative for Maximum, non-positive for Minimum. |
 | $f_0$ | Resonance centre frequency in THz. |
 | $\Gamma$ | Half width at half maximum (HWHM) in THz. |
 
@@ -52,7 +51,7 @@ $$
 | Parameter | Meaning |
 | --- | --- |
 | $b$ | Frequency-independent transmittance background. |
-| $A$ | Peak height above the background. It is constrained to be non-negative. |
+| $A$ | Signed amplitude: non-negative for Maximum, non-positive for Minimum. |
 | $f_0$ | Peak centre frequency in THz. |
 | $\sigma$ | Standard deviation of the Gaussian in THz. |
 
@@ -126,17 +125,24 @@ residual의 모양과 모델의 물리적 타당성은 별도로 확인해야 �
 plot된 residual behavior를 확인하고, 타당한 주파수 범위에서 반복해 보며, 모델을
 비교한 뒤 물리적 결론을 내려야 합니다.
 
-## 현재 한계와 cumulative fitting으로의 확장
 
-현재 fitter는 하나의 constant background와 하나의 양의 대칭 peak만 다룹니다.
-overlapping resonance, 비대칭 Fano shape, resonance dip에는 아직 적합하지 않습니다.
-Cumulative fitting은 모델을 다음과 같은 합으로 확장합니다.
+## Maximum / Minimum and cumulative fitting
 
-$$
-T(f)=b+\sum_{j=1}^{N}T_j(f),
-$$
+Select **Maximum** for upward peaks or **Minimum** for downward dips, then run
+the fit. In Cumulative mode, click each peak/dip first. Changing direction clears
+previous clicks and results. All cumulative components use the same direction;
+mixed peaks and dips are not supported.
 
-여기서 mouse click은 각 항의 초기 peak centre를 제공합니다. 여러 nonlinear peak는
-초기 조건이 모호하면 잘못된 local solution으로 수렴할 수 있으므로 click 정보가
-중요합니다. 다음 단계에서는 multi-peak parameter를 해석하기 전에 residual plot과
-fit-quality metric도 함께 추가해야 합니다.
+Minimum mode initializes the background at the 90th percentile and the single
+center at the lowest measured point, with amplitudes constrained to be non-positive.
+This replaces the positive-amplitude initialization described above for Maximum.
+
+Both `Tmax` / `f @ Tmax` and `Tmin` / `f @ Tmin` are displayed and marked on the
+fitted curve, using the same 4,001-point grid. These are fitted values, not raw
+sample extrema. Single-fit Q uses `f @ Tmin` in Minimum mode and `f @ Tmax` in
+Maximum mode. Dip FWHM is the full width at half depth relative to the background.
+
+Cumulative fits optimize a shared background and all clicked components together.
+The table reports each component center, FWHM and Q (center / FWHM); R-squared
+and adjusted R-squared describe the overall fit. Overlapping components can depend
+strongly on initial clicks. Asymmetric Fano shapes remain unsupported.
